@@ -156,8 +156,6 @@ impl deapbox_core::traits::AgentProcess for StdioAgentProcess {
             Ok(HealthStatus::Dead)
         } else {
             Ok(HealthStatus::Healthy)
-        } else {
-            Ok(HealthStatus::Dead)
         }
     }
 
@@ -224,13 +222,9 @@ mod tests {
             env_vars: std::collections::HashMap::new(),
         };
         let tmp = std::env::temp_dir();
-        let mut proc = StdioAgentProcess::spawn(
-            &config,
-            &tmp,
-            Box::new(PassthroughAdapter),
-        )
-        .await
-        .unwrap();
+        let mut proc = StdioAgentProcess::spawn(&config, &tmp, Box::new(PassthroughAdapter))
+            .await
+            .unwrap();
 
         proc.send_input("hello roundtrip").await.unwrap();
 
@@ -257,13 +251,9 @@ mod tests {
             env_vars: std::collections::HashMap::new(),
         };
         let tmp = std::env::temp_dir();
-        let mut proc = StdioAgentProcess::spawn(
-            &config,
-            &tmp,
-            Box::new(PassthroughAdapter),
-        )
-        .await
-        .unwrap();
+        let mut proc = StdioAgentProcess::spawn(&config, &tmp, Box::new(PassthroughAdapter))
+            .await
+            .unwrap();
 
         // `true` 立即退出，stdout 关闭 → read_line 返回 None → adapter.flush() 为空 → TurnComplete
         let event = proc.recv_output().await.unwrap();
@@ -284,13 +274,9 @@ mod tests {
             env_vars: std::collections::HashMap::new(),
         };
         let tmp = std::env::temp_dir();
-        let proc = StdioAgentProcess::spawn(
-            &config,
-            &tmp,
-            Box::new(PassthroughAdapter),
-        )
-        .await
-        .unwrap();
+        let proc = StdioAgentProcess::spawn(&config, &tmp, Box::new(PassthroughAdapter))
+            .await
+            .unwrap();
 
         // cat 启动后应存活
         let status = proc.health_check().await.unwrap();
@@ -311,13 +297,9 @@ mod tests {
             env_vars: std::collections::HashMap::new(),
         };
         let tmp = std::env::temp_dir();
-        let proc = StdioAgentProcess::spawn(
-            &config,
-            &tmp,
-            Box::new(PassthroughAdapter),
-        )
-        .await
-        .unwrap();
+        let proc = StdioAgentProcess::spawn(&config, &tmp, Box::new(PassthroughAdapter))
+            .await
+            .unwrap();
 
         // 显式 shutdown 应正常完成，不留下子进程（kill_on_drop 兜底）
         // shutdown 以 `self: Box<Self>` 接收，需显式装箱
