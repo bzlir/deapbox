@@ -1,0 +1,20 @@
+[package]
+name = "deapbox-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "deapbox"
+path = "src/main.rs"
+
+[dependencies]
+deapbox-core = { path = "../deapbox-core" }
+deapbox-lark = { path = "../deapbox-lark" }
+deapbox-agent = { path = "../deapbox-agent" }
+deapbox-store = { path = "../deapbox-store" }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+anyhow = "1"
