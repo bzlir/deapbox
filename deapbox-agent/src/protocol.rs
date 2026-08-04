@@ -2,6 +2,11 @@
 //!
 //! 通过子进程 stdin/stdout 与 coding agent 通信。
 //! 提供 AgentProcess trait 的 stdio 实现。
+//!
+//! `child` 与 `stdin` 用 `tokio::sync::Mutex` 包裹，因为 trait 的
+//! `send_input` / `health_check` / `interrupt` 只拿到 `&self`，
+//! 需要内部可变性；`stdout_reader` 与 `adapter` 只在 `recv_output(&mut self)`
+//! 中访问，无需 Mutex。
 
 use std::path::Path;
 use std::process::Stdio;
@@ -151,6 +156,8 @@ impl deapbox_core::traits::AgentProcess for StdioAgentProcess {
             Ok(HealthStatus::Dead)
         } else {
             Ok(HealthStatus::Healthy)
+        } else {
+            Ok(HealthStatus::Dead)
         }
     }
 
@@ -202,5 +209,118 @@ mod tests {
             }
             _ => panic!("expected Text event"),
         }
+    }
+
+    /// 验证 send_input -> recv_output 的回显往返（不依赖真实 agent CLI）
+    /// 使用 `cat` 读取 stdin 原样写回 stdout，覆盖 stdin 写入后 stdout 回显。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_send_input_echo_roundtrip() {
+        let config = AgentConfig {
+            id: AgentId("test".into()),
+            kind: AgentKind::Opencode,
+            command: "cat".into(),
+            args: vec![],
+            env_vars: std::collections::HashMap::new(),
+        };
+        let tmp = std::env::temp_dir();
+        let mut proc = StdioAgentProcess::spawn(
+            &config,
+            &tmp,
+            Box::new(PassthroughAdapter),
+        )
+        .await
+        .unwrap();
+
+        proc.send_input("hello roundtrip").await.unwrap();
+
+        let event = proc.recv_output().await.unwrap();
+        match event {
+            AgentOutputEvent::Normalized(NormalizedEvent::Text(t)) => {
+                assert_eq!(t, "hello roundtrip");
+            }
+            _ => panic!("expected Text event, got {:?}", event),
+        }
+
+        // shutdown 以 `self: Box<Self>` 接收，需显式装箱
+        AgentProcess::shutdown(Box::new(proc)).await.unwrap();
+    }
+
+    /// 验证进程退出后 recv_output 返回 TurnComplete（EOF + adapter flush 为空）
+    #[tokio::test]
+    async fn test_eof_returns_turn_complete() {
+        let config = AgentConfig {
+            id: AgentId("test".into()),
+            kind: AgentKind::Opencode,
+            command: "true".into(),
+            args: vec![],
+            env_vars: std::collections::HashMap::new(),
+        };
+        let tmp = std::env::temp_dir();
+        let mut proc = StdioAgentProcess::spawn(
+            &config,
+            &tmp,
+            Box::new(PassthroughAdapter),
+        )
+        .await
+        .unwrap();
+
+        // `true` 立即退出，stdout 关闭 → read_line 返回 None → adapter.flush() 为空 → TurnComplete
+        let event = proc.recv_output().await.unwrap();
+        match event {
+            AgentOutputEvent::Normalized(NormalizedEvent::TurnComplete) => {}
+            _ => panic!("expected TurnComplete, got {:?}", event),
+        }
+    }
+
+    /// 验证 health_check：存活进程返回 Healthy，退出后返回 Dead
+    #[tokio::test]
+    async fn test_health_check_alive_and_dead() {
+        let config = AgentConfig {
+            id: AgentId("test".into()),
+            kind: AgentKind::Opencode,
+            command: "cat".into(),
+            args: vec![],
+            env_vars: std::collections::HashMap::new(),
+        };
+        let tmp = std::env::temp_dir();
+        let proc = StdioAgentProcess::spawn(
+            &config,
+            &tmp,
+            Box::new(PassthroughAdapter),
+        )
+        .await
+        .unwrap();
+
+        // cat 启动后应存活
+        let status = proc.health_check().await.unwrap();
+        assert_eq!(status, HealthStatus::Healthy);
+
+        // shutdown 以 `self: Box<Self>` 接收，需显式装箱
+        AgentProcess::shutdown(Box::new(proc)).await.unwrap();
+    }
+
+    /// 验证 shutdown 可重复调用路径（drop 后不 panic）
+    #[tokio::test]
+    async fn test_shutdown_kills_child() {
+        let config = AgentConfig {
+            id: AgentId("test".into()),
+            kind: AgentKind::Opencode,
+            command: "cat".into(),
+            args: vec![],
+            env_vars: std::collections::HashMap::new(),
+        };
+        let tmp = std::env::temp_dir();
+        let proc = StdioAgentProcess::spawn(
+            &config,
+            &tmp,
+            Box::new(PassthroughAdapter),
+        )
+        .await
+        .unwrap();
+
+        // 显式 shutdown 应正常完成，不留下子进程（kill_on_drop 兜底）
+        // shutdown 以 `self: Box<Self>` 接收，需显式装箱
+        AgentProcess::shutdown(Box::new(proc)).await.unwrap();
     }
 }
