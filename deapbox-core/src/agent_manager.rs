@@ -16,6 +16,12 @@ impl AgentManagerImpl {
     }
 }
 
+impl Default for AgentManagerImpl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait]
 impl AgentManager for AgentManagerImpl {
     async fn get_or_spawn(
@@ -41,10 +47,7 @@ impl AgentManager for AgentManagerImpl {
         todo!()
     }
 
-    async fn list_sessions(
-        &self,
-        _session: &ChatSession,
-    ) -> Result<Vec<AgentSession>, CoreError> {
+    async fn list_sessions(&self, _session: &ChatSession) -> Result<Vec<AgentSession>, CoreError> {
         todo!()
     }
 }

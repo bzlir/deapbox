@@ -1,5 +1,6 @@
 //! TOML 配置解析
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use deapbox_core::types::{
@@ -42,10 +43,17 @@ struct RawSessionBinding {
 
 impl RawConfig {
     fn into_domain(self) -> Result<AppConfig, ConfigError> {
+        let mut agent_ids = HashSet::new();
         let agents: Vec<AgentConfig> = self
             .agents
             .into_iter()
             .map(|a| {
+                if !agent_ids.insert(a.id.clone()) {
+                    return Err(ConfigError::DuplicateAgentId(a.id));
+                }
+                if a.command.trim().is_empty() {
+                    return Err(ConfigError::EmptyCommand(a.id));
+                }
                 let kind = match a.kind.to_lowercase().as_str() {
                     "opencode" => AgentKind::Opencode,
                     "codex" => AgentKind::Codex,
@@ -63,16 +71,26 @@ impl RawConfig {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
+        let known_agent_ids: HashSet<AgentId> = agents.iter().map(|a| a.id.clone()).collect();
         let sessions = self
             .sessions
             .unwrap_or_default()
             .into_iter()
-            .map(|s| ChatSession {
-                chat_id: ChatId(s.chat_id),
-                agent_id: AgentId(s.agent_id),
-                workspace: WorkspacePath(s.workspace.into()),
+            .map(|s| {
+                let agent_id = AgentId(s.agent_id);
+                if !known_agent_ids.contains(&agent_id) {
+                    return Err(ConfigError::UnknownSessionAgent(agent_id.0));
+                }
+                if s.workspace.trim().is_empty() {
+                    return Err(ConfigError::EmptyWorkspace(s.chat_id));
+                }
+                Ok(ChatSession {
+                    chat_id: ChatId(s.chat_id),
+                    agent_id,
+                    workspace: WorkspacePath(s.workspace.into()),
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(AppConfig {
             lark: LarkConfig {
@@ -91,8 +109,7 @@ impl RawConfig {
 pub fn load_config<P: AsRef<Path>>(path: P) -> Result<AppConfig, ConfigError> {
     let content =
         std::fs::read_to_string(path.as_ref()).map_err(|e| ConfigError::Io(e.to_string()))?;
-    let raw: RawConfig =
-        toml::from_str(&content).map_err(|e| ConfigError::Parse(e.to_string()))?;
+    let raw: RawConfig = toml::from_str(&content).map_err(|e| ConfigError::Parse(e.to_string()))?;
     raw.into_domain()
 }
 
@@ -106,6 +123,14 @@ pub enum ConfigError {
     Parse(String),
     #[error("Unknown agent kind: {0}")]
     UnknownAgentKind(String),
+    #[error("Duplicate agent id: {0}")]
+    DuplicateAgentId(String),
+    #[error("Empty command for agent: {0}")]
+    EmptyCommand(String),
+    #[error("Session references unknown agent: {0}")]
+    UnknownSessionAgent(String),
+    #[error("Empty workspace for chat: {0}")]
+    EmptyWorkspace(String),
 }
 
 #[cfg(test)]
@@ -182,5 +207,90 @@ command = "whatever"
             .unwrap_err()
             .to_string()
             .contains("Unknown agent kind"));
+    }
+
+    #[test]
+    fn test_duplicate_agent_id() {
+        let toml = r#"
+[lark]
+app_id = "cli_xxx"
+app_secret = "secret_xxx"
+
+[[agents]]
+id = "dup"
+kind = "codex"
+command = "codex"
+
+[[agents]]
+id = "dup"
+kind = "opencode"
+command = "opencode"
+"#;
+        let raw: RawConfig = toml::from_str(toml).unwrap();
+        let result = raw.into_domain();
+        assert!(matches!(result, Err(ConfigError::DuplicateAgentId(id)) if id == "dup"));
+    }
+
+    #[test]
+    fn test_empty_agent_command() {
+        let toml = r#"
+[lark]
+app_id = "cli_xxx"
+app_secret = "secret_xxx"
+
+[[agents]]
+id = "codex-dev"
+kind = "codex"
+command = " "
+"#;
+        let raw: RawConfig = toml::from_str(toml).unwrap();
+        let result = raw.into_domain();
+        assert!(matches!(result, Err(ConfigError::EmptyCommand(id)) if id == "codex-dev"));
+    }
+
+    #[test]
+    fn test_session_references_unknown_agent() {
+        let toml = r#"
+[lark]
+app_id = "cli_xxx"
+app_secret = "secret_xxx"
+
+[[agents]]
+id = "codex-dev"
+kind = "codex"
+command = "codex"
+
+[[sessions]]
+chat_id = "oc_xxxxxxxx"
+agent_id = "missing"
+workspace = "/tmp/workspace-1"
+"#;
+        let raw: RawConfig = toml::from_str(toml).unwrap();
+        let result = raw.into_domain();
+        assert!(matches!(result, Err(ConfigError::UnknownSessionAgent(id)) if id == "missing"));
+    }
+
+    #[test]
+    fn test_empty_session_workspace() {
+        let toml = r#"
+[lark]
+app_id = "cli_xxx"
+app_secret = "secret_xxx"
+
+[[agents]]
+id = "codex-dev"
+kind = "codex"
+command = "codex"
+
+[[sessions]]
+chat_id = "oc_xxxxxxxx"
+agent_id = "codex-dev"
+workspace = " "
+"#;
+        let raw: RawConfig = toml::from_str(toml).unwrap();
+        let result = raw.into_domain();
+        assert!(
+            matches!(result, Err(ConfigError::EmptyWorkspace(chat_id)) if chat_id == "oc_xxxxxxxx")
+        );
     }
 }

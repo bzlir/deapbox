@@ -5,19 +5,19 @@
 
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
+use tokio::sync::Mutex;
 
-use deapbox_core::traits::{AgentProcess, ProtocolAdapter};
+use deapbox_core::traits::ProtocolAdapter;
 use deapbox_core::types::*;
 
 /// 基于 stdio pipe 的 AgentProcess 实现
 pub struct StdioAgentProcess {
-    child: Option<Child>,
-    stdin: tokio::process::ChildStdin,
+    child: Mutex<Option<Child>>,
+    stdin: Mutex<tokio::process::ChildStdin>,
     stdout_reader: BufReader<tokio::process::ChildStdout>,
     adapter: Box<dyn ProtocolAdapter>,
 }
@@ -38,9 +38,9 @@ impl StdioAgentProcess {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
-        let mut child =
-            cmd.spawn()
-                .map_err(|e| CoreError::AgentProcess(format!("spawn failed: {}", e)))?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| CoreError::AgentProcess(format!("spawn failed: {}", e)))?;
 
         let stdin = child
             .stdin
@@ -52,8 +52,8 @@ impl StdioAgentProcess {
             .ok_or_else(|| CoreError::AgentProcess("stdout not captured".into()))?;
 
         Ok(Self {
-            child: Some(child),
-            stdin,
+            child: Mutex::new(Some(child)),
+            stdin: Mutex::new(stdin),
             stdout_reader: BufReader::new(stdout),
             adapter,
         })
@@ -84,9 +84,10 @@ impl StdioAgentProcess {
     }
 
     /// 检查子进程是否还活着
-    fn is_alive(&self) -> bool {
-        self.child
-            .as_ref()
+    async fn is_alive(&self) -> bool {
+        let mut child = self.child.lock().await;
+        child
+            .as_mut()
             .and_then(|c| c.try_wait().ok().flatten())
             .is_none()
     }
@@ -95,7 +96,7 @@ impl StdioAgentProcess {
 #[async_trait]
 impl deapbox_core::traits::AgentProcess for StdioAgentProcess {
     async fn send_input(&self, text: &str) -> Result<(), CoreError> {
-        let mut stdin = self.stdin.clone();
+        let mut stdin = self.stdin.lock().await;
         stdin
             .write_all(text.as_bytes())
             .await
@@ -116,7 +117,9 @@ impl deapbox_core::traits::AgentProcess for StdioAgentProcess {
         while let Some(line) = self.read_line().await? {
             let events = self.adapter.process_line(&line);
             if !events.is_empty() {
-                return Ok(AgentOutputEvent::Normalized(events.into_iter().next().unwrap()));
+                return Ok(AgentOutputEvent::Normalized(
+                    events.into_iter().next().unwrap(),
+                ));
             }
             // adapter 过滤了此行（如 spinner），继续读下一行
         }
@@ -133,17 +136,18 @@ impl deapbox_core::traits::AgentProcess for StdioAgentProcess {
     async fn interrupt(&self) -> Result<(), CoreError> {
         #[cfg(unix)]
         {
-            if let Some(child) = &self.child {
-                use nix::sys::signal::{kill, Sig};
+            let child = self.child.lock().await;
+            if let Some(pid) = child.as_ref().and_then(|child| child.id()) {
+                use nix::sys::signal::{kill, Signal};
                 use nix::unistd::Pid;
-                let _ = kill(Pid::from_raw(child.id() as i32), Sig::SIGINT);
+                let _ = kill(Pid::from_raw(pid as i32), Signal::SIGINT);
             }
         }
         Ok(())
     }
 
     async fn health_check(&self) -> Result<HealthStatus, CoreError> {
-        if !self.is_alive() {
+        if !self.is_alive().await {
             Ok(HealthStatus::Dead)
         } else {
             Ok(HealthStatus::Healthy)
@@ -151,7 +155,7 @@ impl deapbox_core::traits::AgentProcess for StdioAgentProcess {
     }
 
     async fn shutdown(mut self: Box<Self>) -> Result<(), CoreError> {
-        if let Some(mut child) = self.child.take() {
+        if let Some(mut child) = self.child.get_mut().take() {
             let _ = child.kill().await;
             let _ = child.wait().await;
         }
@@ -162,7 +166,7 @@ impl deapbox_core::traits::AgentProcess for StdioAgentProcess {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deapbox_core::traits::ProtocolAdapter;
+    use deapbox_core::traits::{AgentProcess, ProtocolAdapter};
 
     /// 一个简单的 adapter，原样输出所有行
     struct PassthroughAdapter;
@@ -187,13 +191,9 @@ mod tests {
             env_vars: std::collections::HashMap::new(),
         };
         let tmp = std::env::temp_dir();
-        let mut proc = StdioAgentProcess::spawn(
-            &config,
-            &tmp,
-            Box::new(PassthroughAdapter),
-        )
-        .await
-        .unwrap();
+        let mut proc = StdioAgentProcess::spawn(&config, &tmp, Box::new(PassthroughAdapter))
+            .await
+            .unwrap();
 
         let event = proc.recv_output().await.unwrap();
         match event {

@@ -9,25 +9,22 @@ use crate::types::*;
 
 /// 默认路由实现
 pub struct RouterImpl {
-    store: Arc<dyn PersistentStore>,
-    agent_manager: Arc<dyn AgentManager>,
+    _store: Arc<dyn PersistentStore>,
+    _agent_manager: Arc<dyn AgentManager>,
 }
 
 impl RouterImpl {
-    pub fn new(
-        store: Arc<dyn PersistentStore>,
-        agent_manager: Arc<dyn AgentManager>,
-    ) -> Self {
+    pub fn new(store: Arc<dyn PersistentStore>, agent_manager: Arc<dyn AgentManager>) -> Self {
         Self {
-            store,
-            agent_manager,
+            _store: store,
+            _agent_manager: agent_manager,
         }
     }
 }
 
 #[async_trait]
 impl Router for RouterImpl {
-    async fn route_user_message(&self, msg: UserMessage) -> Result<(), CoreError> {
+    async fn route_user_message(&self, _msg: UserMessage) -> Result<(), CoreError> {
         // 1. 查找 ChatSession（从 store 或配置中获取 AgentId + Workspace）
         // 2. 通过 AgentManager.get_or_spawn() 获取进程
         // 3. 调用 process.send_input()
