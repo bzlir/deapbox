@@ -1,0 +1,19 @@
+# Rust build artifacts
+/target/
+
+# Local IDE / editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Local personal config (not project-level)
+.claude/
+
+# Environment files
+.env
+.env.local
