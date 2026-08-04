@@ -8,6 +8,10 @@ use crate::traits::{AgentManager, PersistentStore, Router};
 use crate::types::*;
 
 /// 默认路由实现
+///
+/// 字段在阶段1-功能6（核心消息 Router MVP）实现 `route_user_message` 时启用，
+/// 当前为可编译基线占位，故显式允许 `dead_code`。
+#[allow(dead_code)]
 pub struct RouterImpl {
     _store: Arc<dyn PersistentStore>,
     _agent_manager: Arc<dyn AgentManager>,
