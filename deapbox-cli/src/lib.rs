@@ -1,11 +1,13 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use deapbox_core::types::{AppConfig, ChatId, UserMessage};
-use deapbox_lark::{LarkEventBridge, LarkMessageApi, OpenLarkMessageApi};
+use deapbox_lark::{LarkMessageApi, OpenLarkMessageApi};
 use deapbox_store::config::{load_config, ConfigError};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
+
+const OPERATOR_HELP: &str = "/chats | /use <chat_id> | /send <chat_id> <text> | /quit | /exit";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliOptions {
@@ -16,7 +18,7 @@ pub struct CliOptions {
 
 impl CliOptions {
     pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, CliError> {
-        let mut config_path = PathBuf::from("deapbox-cli/src/config.toml");
+        let mut config_path = PathBuf::from("deapbox.toml");
         let mut check_config = false;
         let mut dry_run = false;
         let mut args = args.into_iter();
@@ -61,6 +63,8 @@ pub enum CliError {
     Config(#[from] ConfigError),
     #[error("Lark API setup error: {0}")]
     LarkApi(#[from] deapbox_lark::LarkApiError),
+    #[error("Lark inbound event source is unavailable: {0}")]
+    InboundEventsUnavailable(&'static str),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -68,6 +72,7 @@ pub enum CliError {
 #[derive(Debug, Default)]
 pub struct ConsoleState {
     seen_chats: BTreeMap<ChatId, ChatSummary>,
+    seen_msg_ids: HashSet<String>,
     current_chat: Option<ChatId>,
 }
 
@@ -82,7 +87,11 @@ impl ConsoleState {
         Self::default()
     }
 
-    pub fn record_inbound(&mut self, message: &UserMessage) -> String {
+    pub fn record_inbound(&mut self, message: &UserMessage) -> Option<String> {
+        if !self.seen_msg_ids.insert(message.msg_id.clone()) {
+            return None;
+        }
+
         self.seen_chats.insert(
             message.chat_id.clone(),
             ChatSummary {
@@ -90,10 +99,10 @@ impl ConsoleState {
                 last_text: message.text.clone(),
             },
         );
-        format!(
+        Some(format!(
             "[chat_id={}] sender={} msg_id={} text={}",
             message.chat_id.0, message.sender.0, message.msg_id, message.text
-        )
+        ))
     }
 
     pub fn list_chats(&self) -> Vec<String> {
@@ -145,36 +154,43 @@ pub async fn handle_operator_line<A: LarkMessageApi>(
     api: &A,
     input: &str,
 ) -> CommandResult {
-    let input = input.trim();
-    if input.is_empty() {
+    let input = input.trim_start().trim_end_matches(['\r', '\n']);
+    if input.trim().is_empty() {
         return CommandResult::line("");
     }
 
-    if input == "/quit" || input == "/exit" {
+    let command = input.trim_end();
+
+    if command == "/quit" || command == "/exit" {
         return CommandResult::quit();
     }
-    if input == "/help" {
-        return CommandResult::line("/chats | /use <chat_id> | /send <chat_id> <text> | /quit");
+    if command == "/help" {
+        return CommandResult::line(OPERATOR_HELP);
     }
-    if input == "/chats" {
+    if command == "/chats" {
         return CommandResult {
             output: state.list_chats(),
             should_quit: false,
         };
     }
     if let Some(rest) = input.strip_prefix("/use ") {
-        let chat_id = rest.trim();
-        if chat_id.is_empty() {
-            return CommandResult::line("usage: /use <chat_id>");
-        }
-        state.current_chat = Some(ChatId(chat_id.to_string()));
-        return CommandResult::line(format!("current chat_id={chat_id}"));
+        let chat_id = match parse_chat_id(rest.trim()) {
+            Ok(chat_id) => chat_id,
+            Err(message) => return CommandResult::line(message),
+        };
+        let output = format!("current chat_id={}", chat_id.0);
+        state.current_chat = Some(chat_id);
+        return CommandResult::line(output);
     }
     if let Some(rest) = input.strip_prefix("/send ") {
-        let Some((chat_id, text)) = rest.trim().split_once(char::is_whitespace) else {
+        let Some((chat_id, text)) = split_first_arg(rest) else {
             return CommandResult::line("usage: /send <chat_id> <text>");
         };
-        return send_text(api, ChatId(chat_id.to_string()), text.trim()).await;
+        let chat_id = match parse_chat_id(chat_id) {
+            Ok(chat_id) => chat_id,
+            Err(message) => return CommandResult::line(message),
+        };
+        return send_text(api, chat_id, text).await;
     }
     if input.starts_with('/') {
         return CommandResult::line("unknown command; try /help");
@@ -199,6 +215,25 @@ async fn send_text<A: LarkMessageApi>(api: &A, chat_id: ChatId, text: &str) -> C
     }
 }
 
+fn split_first_arg(input: &str) -> Option<(&str, &str)> {
+    let input = input.trim_start();
+    let split_at = input
+        .char_indices()
+        .find_map(|(index, ch)| ch.is_whitespace().then_some(index))?;
+    let (first, rest) = input.split_at(split_at);
+    Some((first, rest.trim_start()))
+}
+
+fn parse_chat_id(input: &str) -> Result<ChatId, &'static str> {
+    if input.is_empty() {
+        return Err("chat_id cannot be empty");
+    }
+    if input.chars().any(char::is_whitespace) {
+        return Err("chat_id cannot contain whitespace");
+    }
+    Ok(ChatId(input.to_string()))
+}
+
 pub fn load_checked_config(path: &Path) -> Result<AppConfig, CliError> {
     Ok(load_config(path)?)
 }
@@ -212,24 +247,18 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<(),
         return Ok(());
     }
 
-    let (inbound_tx, inbound_rx) = mpsc::channel(128);
-    let _event_bridge = LarkEventBridge::new(inbound_tx);
-    let api = OpenLarkMessageApi::new(&config.lark)?;
+    let _api = OpenLarkMessageApi::new(&config.lark)?;
 
     if options.dry_run {
-        println!("dry-run: config loaded; Lark event bridge is ready");
+        println!(
+            "dry-run: config loaded; outbound Lark API is constructible; inbound event source is not started"
+        );
         return Ok(());
     }
 
-    println!("deapbox console ready. Type /help for commands.");
-    run_console_loop(
-        ConsoleState::new(),
-        api,
-        inbound_rx,
-        tokio::io::BufReader::new(tokio::io::stdin()),
-        tokio::io::stdout(),
-    )
-    .await
+    Err(CliError::InboundEventsUnavailable(
+        "the pinned open-lark WebSocket handler does not expose event payload forwarding yet; run --dry-run for startup validation or wire a real inbound source before starting the service",
+    ))
 }
 
 pub async fn run_console_loop<A, R, W>(
@@ -249,10 +278,14 @@ where
 
     loop {
         tokio::select! {
+            biased;
+
             message = inbound_rx.recv(), if inbound_open => {
                 match message {
                     Some(message) => {
-                        write_line(&mut stdout, &state.record_inbound(&message)).await?;
+                        if let Some(line) = state.record_inbound(&message) {
+                            write_line(&mut stdout, &line).await?;
+                        }
                     }
                     None => {
                         inbound_open = false;
@@ -337,8 +370,12 @@ mod tests {
     #[test]
     fn interleaved_inbound_messages_print_distinct_chat_ids() {
         let mut state = ConsoleState::new();
-        let first = state.record_inbound(&message("oc_a", "ou_1", "om_1", "hello A"));
-        let second = state.record_inbound(&message("oc_b", "ou_2", "om_2", "hello B"));
+        let first = state
+            .record_inbound(&message("oc_a", "ou_1", "om_1", "hello A"))
+            .unwrap();
+        let second = state
+            .record_inbound(&message("oc_b", "ou_2", "om_2", "hello B"))
+            .unwrap();
 
         assert!(first.contains("chat_id=oc_a"));
         assert!(first.contains("sender=ou_1"));
@@ -346,6 +383,16 @@ mod tests {
         assert!(second.contains("chat_id=oc_b"));
         assert!(second.contains("sender=ou_2"));
         assert!(second.contains("text=hello B"));
+    }
+
+    #[test]
+    fn duplicate_inbound_msg_id_is_skipped() {
+        let mut state = ConsoleState::new();
+        let first = message("oc_a", "ou_1", "om_same", "hello");
+        let retry = message("oc_a", "ou_1", "om_same", "hello again");
+
+        assert!(state.record_inbound(&first).is_some());
+        assert_eq!(state.record_inbound(&retry), None);
     }
 
     #[tokio::test]
@@ -379,6 +426,28 @@ mod tests {
                 (ChatId("oc_b".to_string()), "hello B".to_string()),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn invalid_chat_id_is_rejected_before_use() {
+        let api = FakeLarkApi::default();
+        let mut state = ConsoleState::new();
+
+        let result = handle_operator_line(&mut state, &api, "/use oc a").await;
+
+        assert_eq!(result.output, vec!["chat_id cannot contain whitespace"]);
+        assert!(api.sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_command_rejects_empty_text_consistently() {
+        let api = FakeLarkApi::default();
+        let mut state = ConsoleState::new();
+
+        let result = handle_operator_line(&mut state, &api, "/send oc_a ").await;
+
+        assert_eq!(result.output, vec!["message text cannot be empty"]);
+        assert!(api.sent.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -429,6 +498,39 @@ command = "codex"
 
         assert!(load_checked_config(&valid).is_ok());
         assert!(load_checked_config(&invalid).is_err());
+    }
+
+    #[tokio::test]
+    async fn non_dry_run_fails_when_inbound_source_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("valid.toml");
+        std::fs::write(
+            &config,
+            r#"
+[lark]
+app_id = "cli_xxx"
+app_secret = "secret_xxx"
+
+[[agents]]
+id = "codex-dev"
+kind = "codex"
+command = "codex"
+"#,
+        )
+        .unwrap();
+
+        let err = run_from_args(vec!["--config".to_string(), config.display().to_string()])
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, CliError::InboundEventsUnavailable(_)));
+    }
+
+    #[test]
+    fn default_config_path_is_cwd_relative() {
+        let options = CliOptions::parse(Vec::<String>::new()).unwrap();
+
+        assert_eq!(options.config_path, PathBuf::from("deapbox.toml"));
     }
 
     fn message(chat_id: &str, sender: &str, msg_id: &str, text: &str) -> UserMessage {
