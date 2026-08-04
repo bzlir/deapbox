@@ -43,9 +43,9 @@ impl StdioAgentProcess {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
-        let mut child =
-            cmd.spawn()
-                .map_err(|e| CoreError::AgentProcess(format!("spawn failed: {}", e)))?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| CoreError::AgentProcess(format!("spawn failed: {}", e)))?;
 
         let stdin = child
             .stdin
@@ -90,11 +90,11 @@ impl StdioAgentProcess {
 
     /// 检查子进程是否还活着
     async fn is_alive(&self) -> bool {
-        let mut guard = self.child.lock().await;
-        match guard.as_mut() {
-            Some(c) => c.try_wait().ok().flatten().is_none(),
-            None => false,
-        }
+        let mut child = self.child.lock().await;
+        child
+            .as_mut()
+            .and_then(|c| c.try_wait().ok().flatten())
+            .is_none()
     }
 }
 
@@ -122,7 +122,9 @@ impl deapbox_core::traits::AgentProcess for StdioAgentProcess {
         while let Some(line) = self.read_line().await? {
             let events = self.adapter.process_line(&line);
             if !events.is_empty() {
-                return Ok(AgentOutputEvent::Normalized(events.into_iter().next().unwrap()));
+                return Ok(AgentOutputEvent::Normalized(
+                    events.into_iter().next().unwrap(),
+                ));
             }
             // adapter 过滤了此行（如 spinner），继续读下一行
         }
@@ -139,20 +141,20 @@ impl deapbox_core::traits::AgentProcess for StdioAgentProcess {
     async fn interrupt(&self) -> Result<(), CoreError> {
         #[cfg(unix)]
         {
-            use nix::sys::signal::{kill, Signal};
-            use nix::unistd::Pid;
-            let guard = self.child.lock().await;
-            if let Some(child) = guard.as_ref() {
-                if let Some(pid) = child.id() {
-                    let _ = kill(Pid::from_raw(pid as i32), Signal::SIGINT);
-                }
+            let child = self.child.lock().await;
+            if let Some(pid) = child.as_ref().and_then(|child| child.id()) {
+                use nix::sys::signal::{kill, Signal};
+                use nix::unistd::Pid;
+                let _ = kill(Pid::from_raw(pid as i32), Signal::SIGINT);
             }
         }
         Ok(())
     }
 
     async fn health_check(&self) -> Result<HealthStatus, CoreError> {
-        if self.is_alive().await {
+        if !self.is_alive().await {
+            Ok(HealthStatus::Dead)
+        } else {
             Ok(HealthStatus::Healthy)
         } else {
             Ok(HealthStatus::Dead)
@@ -160,8 +162,7 @@ impl deapbox_core::traits::AgentProcess for StdioAgentProcess {
     }
 
     async fn shutdown(mut self: Box<Self>) -> Result<(), CoreError> {
-        let mut guard = self.child.lock().await;
-        if let Some(mut child) = guard.take() {
+        if let Some(mut child) = self.child.get_mut().take() {
             let _ = child.kill().await;
             let _ = child.wait().await;
         }
@@ -197,13 +198,9 @@ mod tests {
             env_vars: std::collections::HashMap::new(),
         };
         let tmp = std::env::temp_dir();
-        let mut proc = StdioAgentProcess::spawn(
-            &config,
-            &tmp,
-            Box::new(PassthroughAdapter),
-        )
-        .await
-        .unwrap();
+        let mut proc = StdioAgentProcess::spawn(&config, &tmp, Box::new(PassthroughAdapter))
+            .await
+            .unwrap();
 
         let event = proc.recv_output().await.unwrap();
         match event {

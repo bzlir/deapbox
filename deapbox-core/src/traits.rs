@@ -50,10 +50,8 @@ pub trait Router: Send + Sync {
 /// Agent 进程生命周期管理
 #[async_trait]
 pub trait AgentManager: Send + Sync {
-    async fn get_or_spawn(
-        &self,
-        session: &ChatSession,
-    ) -> Result<Arc<dyn AgentProcess>, CoreError>;
+    async fn get_or_spawn(&self, session: &ChatSession)
+        -> Result<Arc<dyn AgentProcess>, CoreError>;
     async fn create_session(
         &self,
         session: &ChatSession,
@@ -64,31 +62,18 @@ pub trait AgentManager: Send + Sync {
         session: &ChatSession,
         key: &str,
     ) -> Result<Arc<dyn AgentProcess>, CoreError>;
-    async fn list_sessions(
-        &self,
-        session: &ChatSession,
-    ) -> Result<Vec<AgentSession>, CoreError>;
+    async fn list_sessions(&self, session: &ChatSession) -> Result<Vec<AgentSession>, CoreError>;
 }
 
 /// 持久化存储
 #[async_trait]
 pub trait PersistentStore: Send + Sync {
-    async fn get_session_binding(
-        &self,
-        chat_id: &ChatId,
-    ) -> Result<Option<AgentId>, CoreError>;
+    async fn get_session_binding(&self, chat_id: &ChatId) -> Result<Option<AgentId>, CoreError>;
     async fn set_session_binding(
         &self,
         chat_id: &ChatId,
         agent_id: &AgentId,
     ) -> Result<(), CoreError>;
-    async fn get_resume_key(
-        &self,
-        chat_id: &ChatId,
-    ) -> Result<Option<String>, CoreError>;
-    async fn set_resume_key(
-        &self,
-        chat_id: &ChatId,
-        key: &str,
-    ) -> Result<(), CoreError>;
+    async fn get_resume_key(&self, chat_id: &ChatId) -> Result<Option<String>, CoreError>;
+    async fn set_resume_key(&self, chat_id: &ChatId, key: &str) -> Result<(), CoreError>;
 }

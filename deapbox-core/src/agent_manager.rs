@@ -47,10 +47,7 @@ impl AgentManager for AgentManagerImpl {
         todo!()
     }
 
-    async fn list_sessions(
-        &self,
-        _session: &ChatSession,
-    ) -> Result<Vec<AgentSession>, CoreError> {
+    async fn list_sessions(&self, _session: &ChatSession) -> Result<Vec<AgentSession>, CoreError> {
         todo!()
     }
 }

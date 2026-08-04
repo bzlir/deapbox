@@ -13,18 +13,15 @@ use crate::types::*;
 /// 当前为可编译基线占位，故显式允许 `dead_code`。
 #[allow(dead_code)]
 pub struct RouterImpl {
-    store: Arc<dyn PersistentStore>,
-    agent_manager: Arc<dyn AgentManager>,
+    _store: Arc<dyn PersistentStore>,
+    _agent_manager: Arc<dyn AgentManager>,
 }
 
 impl RouterImpl {
-    pub fn new(
-        store: Arc<dyn PersistentStore>,
-        agent_manager: Arc<dyn AgentManager>,
-    ) -> Self {
+    pub fn new(store: Arc<dyn PersistentStore>, agent_manager: Arc<dyn AgentManager>) -> Self {
         Self {
-            store,
-            agent_manager,
+            _store: store,
+            _agent_manager: agent_manager,
         }
     }
 }
