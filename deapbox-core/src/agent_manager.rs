@@ -16,6 +16,12 @@ impl AgentManagerImpl {
     }
 }
 
+impl Default for AgentManagerImpl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait]
 impl AgentManager for AgentManagerImpl {
     async fn get_or_spawn(
