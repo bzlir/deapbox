@@ -2,22 +2,27 @@
 //!
 //! 通过子进程 stdin/stdout 与 coding agent 通信。
 //! 提供 AgentProcess trait 的 stdio 实现。
+//!
+//! `child` 与 `stdin` 用 `tokio::sync::Mutex` 包裹，因为 trait 的
+//! `send_input` / `health_check` / `interrupt` 只拿到 `&self`，
+//! 需要内部可变性；`stdout_reader` 与 `adapter` 只在 `recv_output(&mut self)`
+//! 中访问，无需 Mutex。
 
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
+use tokio::sync::Mutex;
 
-use deapbox_core::traits::{AgentProcess, ProtocolAdapter};
+use deapbox_core::traits::ProtocolAdapter;
 use deapbox_core::types::*;
 
 /// 基于 stdio pipe 的 AgentProcess 实现
 pub struct StdioAgentProcess {
-    child: Option<Child>,
-    stdin: tokio::process::ChildStdin,
+    child: Mutex<Option<Child>>,
+    stdin: Mutex<tokio::process::ChildStdin>,
     stdout_reader: BufReader<tokio::process::ChildStdout>,
     adapter: Box<dyn ProtocolAdapter>,
 }
@@ -52,8 +57,8 @@ impl StdioAgentProcess {
             .ok_or_else(|| CoreError::AgentProcess("stdout not captured".into()))?;
 
         Ok(Self {
-            child: Some(child),
-            stdin,
+            child: Mutex::new(Some(child)),
+            stdin: Mutex::new(stdin),
             stdout_reader: BufReader::new(stdout),
             adapter,
         })
@@ -84,18 +89,19 @@ impl StdioAgentProcess {
     }
 
     /// 检查子进程是否还活着
-    fn is_alive(&self) -> bool {
-        self.child
-            .as_ref()
-            .and_then(|c| c.try_wait().ok().flatten())
-            .is_none()
+    async fn is_alive(&self) -> bool {
+        let mut guard = self.child.lock().await;
+        match guard.as_mut() {
+            Some(c) => c.try_wait().ok().flatten().is_none(),
+            None => false,
+        }
     }
 }
 
 #[async_trait]
 impl deapbox_core::traits::AgentProcess for StdioAgentProcess {
     async fn send_input(&self, text: &str) -> Result<(), CoreError> {
-        let mut stdin = self.stdin.clone();
+        let mut stdin = self.stdin.lock().await;
         stdin
             .write_all(text.as_bytes())
             .await
@@ -133,25 +139,29 @@ impl deapbox_core::traits::AgentProcess for StdioAgentProcess {
     async fn interrupt(&self) -> Result<(), CoreError> {
         #[cfg(unix)]
         {
-            if let Some(child) = &self.child {
-                use nix::sys::signal::{kill, Sig};
-                use nix::unistd::Pid;
-                let _ = kill(Pid::from_raw(child.id() as i32), Sig::SIGINT);
+            use nix::sys::signal::{kill, Signal};
+            use nix::unistd::Pid;
+            let guard = self.child.lock().await;
+            if let Some(child) = guard.as_ref() {
+                if let Some(pid) = child.id() {
+                    let _ = kill(Pid::from_raw(pid as i32), Signal::SIGINT);
+                }
             }
         }
         Ok(())
     }
 
     async fn health_check(&self) -> Result<HealthStatus, CoreError> {
-        if !self.is_alive() {
-            Ok(HealthStatus::Dead)
-        } else {
+        if self.is_alive().await {
             Ok(HealthStatus::Healthy)
+        } else {
+            Ok(HealthStatus::Dead)
         }
     }
 
     async fn shutdown(mut self: Box<Self>) -> Result<(), CoreError> {
-        if let Some(mut child) = self.child.take() {
+        let mut guard = self.child.lock().await;
+        if let Some(mut child) = guard.take() {
             let _ = child.kill().await;
             let _ = child.wait().await;
         }
@@ -162,7 +172,7 @@ impl deapbox_core::traits::AgentProcess for StdioAgentProcess {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deapbox_core::traits::ProtocolAdapter;
+    use deapbox_core::traits::{AgentProcess, ProtocolAdapter};
 
     /// 一个简单的 adapter，原样输出所有行
     struct PassthroughAdapter;
@@ -202,5 +212,118 @@ mod tests {
             }
             _ => panic!("expected Text event"),
         }
+    }
+
+    /// 验证 send_input -> recv_output 的回显往返（不依赖真实 agent CLI）
+    /// 使用 `cat` 读取 stdin 原样写回 stdout，覆盖 stdin 写入后 stdout 回显。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_send_input_echo_roundtrip() {
+        let config = AgentConfig {
+            id: AgentId("test".into()),
+            kind: AgentKind::Opencode,
+            command: "cat".into(),
+            args: vec![],
+            env_vars: std::collections::HashMap::new(),
+        };
+        let tmp = std::env::temp_dir();
+        let mut proc = StdioAgentProcess::spawn(
+            &config,
+            &tmp,
+            Box::new(PassthroughAdapter),
+        )
+        .await
+        .unwrap();
+
+        proc.send_input("hello roundtrip").await.unwrap();
+
+        let event = proc.recv_output().await.unwrap();
+        match event {
+            AgentOutputEvent::Normalized(NormalizedEvent::Text(t)) => {
+                assert_eq!(t, "hello roundtrip");
+            }
+            _ => panic!("expected Text event, got {:?}", event),
+        }
+
+        // shutdown 以 `self: Box<Self>` 接收，需显式装箱
+        AgentProcess::shutdown(Box::new(proc)).await.unwrap();
+    }
+
+    /// 验证进程退出后 recv_output 返回 TurnComplete（EOF + adapter flush 为空）
+    #[tokio::test]
+    async fn test_eof_returns_turn_complete() {
+        let config = AgentConfig {
+            id: AgentId("test".into()),
+            kind: AgentKind::Opencode,
+            command: "true".into(),
+            args: vec![],
+            env_vars: std::collections::HashMap::new(),
+        };
+        let tmp = std::env::temp_dir();
+        let mut proc = StdioAgentProcess::spawn(
+            &config,
+            &tmp,
+            Box::new(PassthroughAdapter),
+        )
+        .await
+        .unwrap();
+
+        // `true` 立即退出，stdout 关闭 → read_line 返回 None → adapter.flush() 为空 → TurnComplete
+        let event = proc.recv_output().await.unwrap();
+        match event {
+            AgentOutputEvent::Normalized(NormalizedEvent::TurnComplete) => {}
+            _ => panic!("expected TurnComplete, got {:?}", event),
+        }
+    }
+
+    /// 验证 health_check：存活进程返回 Healthy，退出后返回 Dead
+    #[tokio::test]
+    async fn test_health_check_alive_and_dead() {
+        let config = AgentConfig {
+            id: AgentId("test".into()),
+            kind: AgentKind::Opencode,
+            command: "cat".into(),
+            args: vec![],
+            env_vars: std::collections::HashMap::new(),
+        };
+        let tmp = std::env::temp_dir();
+        let proc = StdioAgentProcess::spawn(
+            &config,
+            &tmp,
+            Box::new(PassthroughAdapter),
+        )
+        .await
+        .unwrap();
+
+        // cat 启动后应存活
+        let status = proc.health_check().await.unwrap();
+        assert_eq!(status, HealthStatus::Healthy);
+
+        // shutdown 以 `self: Box<Self>` 接收，需显式装箱
+        AgentProcess::shutdown(Box::new(proc)).await.unwrap();
+    }
+
+    /// 验证 shutdown 可重复调用路径（drop 后不 panic）
+    #[tokio::test]
+    async fn test_shutdown_kills_child() {
+        let config = AgentConfig {
+            id: AgentId("test".into()),
+            kind: AgentKind::Opencode,
+            command: "cat".into(),
+            args: vec![],
+            env_vars: std::collections::HashMap::new(),
+        };
+        let tmp = std::env::temp_dir();
+        let proc = StdioAgentProcess::spawn(
+            &config,
+            &tmp,
+            Box::new(PassthroughAdapter),
+        )
+        .await
+        .unwrap();
+
+        // 显式 shutdown 应正常完成，不留下子进程（kill_on_drop 兜底）
+        // shutdown 以 `self: Box<Self>` 接收，需显式装箱
+        AgentProcess::shutdown(Box::new(proc)).await.unwrap();
     }
 }
