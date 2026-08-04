@@ -381,12 +381,15 @@ name = "deapbox-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "deapbox-agent",
  "deapbox-core",
  "deapbox-lark",
  "deapbox-store",
  "serde",
  "serde_json",
+ "tempfile",
+ "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",
