@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = [
+    "deapbox-core",
+    "deapbox-lark",
+    "deapbox-agent",
+    "deapbox-store",
+    "deapbox-cli",
+]
