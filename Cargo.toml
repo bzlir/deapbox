@@ -7,3 +7,6 @@ members = [
     "deapbox-store",
     "deapbox-cli",
 ]
+
+[workspace.dependencies]
+open-lark = { git = "https://github.com/talkcody/open-lark.git", default-features = false, features = ["communication"] }
