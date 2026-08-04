@@ -4,9 +4,9 @@
 pub use deapbox_core::traits::{AgentDriver, AgentProcess, ProtocolAdapter};
 pub use deapbox_core::types::*;
 
-pub mod protocol;
 pub mod adapter;
-pub mod opencode;
-pub mod codex;
 pub mod claude_code;
+pub mod codex;
 pub mod kimi_code;
+pub mod opencode;
+pub mod protocol;
