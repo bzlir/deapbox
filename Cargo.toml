@@ -9,4 +9,4 @@ members = [
 ]
 
 [workspace.dependencies]
-open-lark = { git = "https://github.com/talkcody/open-lark.git", default-features = false, features = ["communication"] }
+openlark = { version = "0.20.0", default-features = false, features = ["auth", "communication"] }
