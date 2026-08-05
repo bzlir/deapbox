@@ -13,3 +13,4 @@ thiserror = "2"
 strip-ansi-escapes = "0.2"
 regex = "1"
 nix = { version = "0.29", features = ["signal"] }
+log = "0.4"
