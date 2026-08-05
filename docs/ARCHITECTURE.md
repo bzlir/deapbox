@@ -19,8 +19,8 @@
 ```mermaid
 graph TB
     subgraph "飞书 (Lark)"
-        LarkWS[WebSocket 长连接<br/>open-lark]
-        LarkAPI[OpenAPI<br/>open-lark]
+        LarkWS[WebSocket 长连接<br/>openlark]
+        LarkAPI[OpenAPI<br/>openlark]
     end
 
     subgraph "deapbox-cli"
@@ -33,10 +33,10 @@ graph TB
             Traits["Traits<br/>AgentDriver / AgentSession / OutputSink / PersistentStore"]
         end
 
-        subgraph "deapbox-lark (薄适配层, 基于 open-lark)"
+        subgraph "deapbox-lark (薄适配层, 基于 openlark)"
             LarkEvent["Event Loop<br/>飞书事件 → UserMessage/BotCommand"]
             LarkCard["Card Streamer<br/>OutputSink 实现"]
-            LarkSDK["open-lark client<br/>不自研 HTTP/WS/卡片"]
+            LarkSDK["openlark client<br/>不自研 HTTP/WS/卡片"]
         end
 
         subgraph "deapbox-agent"
@@ -85,7 +85,7 @@ graph TB
 ```mermaid
 sequenceDiagram
     participant User as 飞书用户
-    participant Lark as open-lark WS
+    participant Lark as openlark WS
     participant Event as Event Loop
     participant Router as Router
     participant Store as PersistentStore (sled)
@@ -180,7 +180,7 @@ graph TD
     LARK --> CORE
     AGENT --> CORE
     STORE --> CORE
-    LARK -.->|依赖| OpenLark[open-lark crate]
+    LARK -.->|依赖| OpenLark[openlark crate]
 ```
 
 ## 5. 主循环事件调度
@@ -261,12 +261,12 @@ deapbox/
 │       ├── router.rs                  # task-per-message 路由
 │       └── agent_manager.rs           # 会话表
 │
-├── deapbox-lark/                      # 飞书适配（基于 open-lark，不自研底层）
-│   ├── Cargo.toml                     # 依赖 open-lark，无 reqwest/tungstenite
+├── deapbox-lark/                      # 飞书适配（基于 openlark，不自研底层）
+│   ├── Cargo.toml                     # 依赖 openlark，无 reqwest/tungstenite
 │   └── src/
 │       ├── lib.rs
 │       ├── event.rs                   # 事件 → UserMessage/BotCommand
-│       ├── api.rs                     # open-lark client 封装
+│       ├── api.rs                     # openlark client 封装
 │       ├── card.rs                    # OutputSink 实现
 │       └── types.rs
 │
