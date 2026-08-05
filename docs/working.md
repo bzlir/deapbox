@@ -25,6 +25,19 @@
 
 ---
 
+### 2026-08-05 — TES-86：迁移 deapbox-core 到锁定设计（Q1-Q4）
+
+**更改内容：**
+
+- `deapbox-core/src/types.rs`：删旧 `AgentSession` struct（带 `agent_session_key`，已死码）与 `NormalizedEvent::TurnComplete`（turn 边界改由 agent 自己说，见 lesson #2）；`AgentOutputEvent` → `AgentEvent { Normalized(NormalizedEvent), TurnEnd{resume_key: Option<String>}, Exited(Option<i32>), Failed(CoreError) }`；新增 `Binding { agent_id, workspace }`（`get_session_binding` 返回类型）；`CoreError` 改 `Clone`（`Io` 从 `#[from] std::io::Error` 改 `Io(String)`，因 `io::Error` 非 `Clone`）以让 `AgentEvent` 走 `tokio::sync::broadcast` 多接收端（见 lesson #9）。
+- `deapbox-core/src/traits.rs`（重写）：删 `AgentProcess`（三方所有权矛盾，lesson #5）与 `ProtocolAdapter`（解散进 per-kind session）；新增 `AgentDriver`（`start_session(resume, ws) -> Box<dyn AgentSession>`）、`AgentSession`（全 `&self`：`send` / `subscribe -> broadcast::Receiver<AgentEvent>` / `interrupt` / `current_resume_key` / `alive` / `close(self: Box<Self>)`）、`Router` + `TurnHandle`（返回 turn 句柄，非阻塞）、`OutputSink`（`consume`/`on_turn_end`/`on_error`）、`AgentManager::get_or_start(chat, binding) -> Arc<dyn AgentSession>`（**非**原文 `Box`，理由见 lesson #8）、`PersistentStore`（binding 含 workspace）。末尾加编译期 `Send + Sync` 断言。
+- `deapbox-core/src/router.rs` / `agent_manager.rs`：签名对齐新 trait（`todo!()` stub，可编译）。
+- `deapbox-agent/src/protocol.rs`：删旧 `StdioAgentProcess`（~250 行 impl+test，含 `ChildStdin::clone`/`try_wait`/`nix::Sig`/`child.id()`）；改为 `spawn_stdio` + `StdioHandles` 共享工具（per-kind session 复用），含一个 echo smoke test。
+- `deapbox-store/src/store.rs`：`SessionBindingValue` 加 `workspace`；`get_session_binding -> Option<Binding>`；`set_session_binding` 加 `workspace` 参数；测试对齐新签名。
+- `deapbox-agent/src/lib.rs`：re-export 去 `AgentProcess` / `ProtocolAdapter`。
+
+**影响：** TES-79/81/82/84 可直接基于新 trait 实现，不再返工核心。旧 `AgentProcess` / `recv_output` / `StdioAgentProcess` 从代码消失。`deapbox-cli` / `deapbox-lark` 不受影响（未触旧 trait）。
+
 <!-- 后续条目按以下模板追加：
 ### YYYY-MM-DD — 简标题
 
@@ -68,6 +81,16 @@ cc-connect 的真实机制（stream-json、result 事件、compaction 过滤、�
 ### 7. grill 是双向的，认错要快
 
 用户两次纠正我（Q3 多线程-per-chat 越界、resume_key 该在 sled 不在 ChatSession）。每次我都用源码证据验证后立即认错并修正。**grill 的目的是逼近正确设计，不是守住自己的面子。** 对的决策就接受，证据优先于立场。
+
+---
+
+### 8. trait shape 要算清"谁 own 进程"，Box 和 Arc 不能在会话表上混
+
+TES-86 原文写 `get_or_start -> Box<dyn AgentSession>` + 会话表 `Map<ChatId, Box<dyn AgentSession>>`——表 own 着 Box 却又要"查表命中则复用"时往外 return `Box`，等于把会话从表里**移走**：下一条消息查表为空，会 spawn 新进程，长驻 claude 的跨 turn 复用直接失效。Box lend-out 模型只在"一 chat 严格串行单 turn、turn 间表项空窗期无新消息"时勉强成立，但仍违背"复用 long-lived 进程"的初衷，且与 task-per-message 并发模型冲突。**会话表要既保留又分发，唯一 sound 形态是 `Arc<dyn AgentSession>`**：表持 Arc clone，Router task 持另一 clone，`send`/`subscribe` 全 `&self` 让共享无死结。`start_session -> Box`（driver 产出 owned）与 `close(self: Box<Self>)`（显式消费 owned）仍可保留——它们在 owned 边界，不在"表 ↔ task 共享"路径上。**设计 trait 时先画清所有权图：谁创建、谁持有、谁共享、谁销毁；Box 与 Arc 的边界要对得上，否则类型系统会（也应该）拦住你。**
+
+### 9. 把错误塞进事件流，错误类型就得 Clone
+
+为了让 `AgentEvent::Failed(CoreError)` 走 `tokio::sync::broadcast`（TES-81 要测 `subscribe()` 多接收端不丢事件），`AgentEvent` 要 `Clone`，倒逼 `CoreError: Clone`。但 `CoreError::Io(#[from] std::io::Error)` 卡住——`std::io::Error` 非 `Clone`。解法不是给 `CoreError` 套 `Arc` 也不是弃用 `#[from]`，而是认清：错误一旦进**事件流**（vs 进 `Result` 返回值），它的角色就从"一次返回的对象"变成"被多次消费的值"，天生需要 `Clone`。把 `Io` 改成 `Io(String)`（错误信息字符串化）是正确的取舍——存的是"错误的描述"而非"错误对象本身"。**`Result<E>` 里的错误可以不 `Clone`；`event stream` 里的错误必须 `Clone`，设计 trait 时先想清错误走哪条路。**
 
 ---
 

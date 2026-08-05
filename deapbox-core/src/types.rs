@@ -1,6 +1,5 @@
 //! 核心数据结构
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -51,15 +50,14 @@ pub struct AgentConfig {
     pub env_vars: std::collections::HashMap<String, String>,
 }
 
-/// AgentSession — agent 内部的一个工作会话（通过 resume 恢复）
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentSession {
-    pub id: AgentSessionId,
+/// Binding — `PersistentStore::get_session_binding` 的返回值。
+///
+/// `resume_key` 不在这里（它是热键，独立 KV；见 working.md lesson #4）。
+/// `ChatSession` 是首启 seed + 配置态；`Binding` 是运行时从 sled 读出的冷绑定。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Binding {
     pub agent_id: AgentId,
-    pub agent_session_key: String,
     pub workspace: WorkspacePath,
-    pub created_at: DateTime<Utc>,
-    pub last_active: DateTime<Utc>,
 }
 
 // ============ 消息 / 事件 ============
@@ -73,7 +71,10 @@ pub struct UserMessage {
     pub msg_id: String,
 }
 
-/// 标准化输出事件 — 各 agent 原始输出经 adapter 清洗后的统一格式
+/// 标准化输出事件 — per-kind session 把 agent 原生 stream-json 事件映射到此。
+///
+/// 注意：`TurnComplete` 已移除（turn 结束是 `AgentEvent::TurnEnd`，由 agent 自己说，
+/// 见 working.md lesson #2）。
 #[derive(Debug, Clone)]
 pub enum NormalizedEvent {
     /// 最终回复文本
@@ -84,23 +85,33 @@ pub enum NormalizedEvent {
     ToolCall(String),
     /// 工具执行结果
     ToolResult(String),
-    /// 当前 turn 结束
-    TurnComplete,
-    /// 错误
+    /// 错误（agent 自报的 error 事件）
     Error { message: String, fatal: bool },
 }
 
-/// Agent 输出事件（adapter 层之外统一从此取得）
+/// Agent 事件流 — per-kind `AgentSession` 通过 `subscribe()` 输出。
+///
+/// `TurnEnd`/`Exited`/`Failed` 在流里，不再由 host 猜（非 idle-timeout / 非 EOF）。
+/// `Clone` 以便 `tokio::sync::broadcast` 多接收端（TES-81 测试 subscribe 多端）。
 #[derive(Debug, Clone)]
-pub enum AgentOutputEvent {
+pub enum AgentEvent {
+    /// adapter 清洗后的标准化事件
     Normalized(NormalizedEvent),
-    /// agent 返回 session key
-    SessionCreated(AgentSessionId, String),
+    /// 本轮结束；`resume_key` 来自 agent 的 `result` 事件（`None` 表示无 resume）。
+    /// `subtype: compact/compaction` 的 `result` 不发 `TurnEnd`（TES-79 过滤）。
+    TurnEnd { resume_key: Option<String> },
+    /// 进程退出（kimi 正常退出 / claude 异常）；code 为退出码
+    Exited(Option<i32>),
+    /// 会话失败
+    Failed(CoreError),
 }
 
 // ============ 命令 ============
 
 /// 飞书消息中识别的 bot 命令
+///
+/// 注意：变体语义将在 TES-82（AgentManager BotCommand 处理）中按
+/// `/new` `/switch agent <id>` `/switch workspace <path>` `/session` 重画。
 #[derive(Debug, Clone)]
 pub enum BotCommand {
     NewSession(Option<String>),
@@ -134,7 +145,9 @@ pub struct AppConfig {
 
 // ============ 错误类型 ============
 
-#[derive(Debug, thiserror::Error)]
+/// `Clone` 是为了让 `AgentEvent::Failed(CoreError)` 走 `tokio::sync::broadcast`
+/// 多接收端（`Io` 用 `String` 而非 `#[from] std::io::Error`，后者非 `Clone`）。
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum CoreError {
     #[error("Agent not found: {0}")]
     AgentNotFound(String),
@@ -147,5 +160,5 @@ pub enum CoreError {
     #[error("Lark error: {0}")]
     Lark(String),
     #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(String),
 }

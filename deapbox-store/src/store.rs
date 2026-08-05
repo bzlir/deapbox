@@ -4,7 +4,7 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use deapbox_core::traits::PersistentStore;
-use deapbox_core::types::{AgentId, ChatId, CoreError};
+use deapbox_core::types::{AgentId, Binding, ChatId, CoreError, WorkspacePath};
 use serde::{Deserialize, Serialize};
 
 const BINDING_PREFIX: &str = "binding:";
@@ -15,6 +15,8 @@ const VALUE_VERSION: u8 = 1;
 ///
 /// The public API stays semantic: callers read and write chat bindings and
 /// resume keys, while the concrete key schema remains private to this module.
+/// `binding:{chat_id}`（冷，含 workspace）+ `resume:{chat_id}`（热）分存
+/// ——见 `docs/working.md` lesson #4。
 pub struct SledStore {
     db: sled::Db,
 }
@@ -23,6 +25,7 @@ pub struct SledStore {
 struct SessionBindingValue {
     version: u8,
     agent_id: AgentId,
+    workspace: WorkspacePath,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -62,7 +65,7 @@ impl SledStore {
 
 #[async_trait]
 impl PersistentStore for SledStore {
-    async fn get_session_binding(&self, chat_id: &ChatId) -> Result<Option<AgentId>, CoreError> {
+    async fn get_session_binding(&self, chat_id: &ChatId) -> Result<Option<Binding>, CoreError> {
         let Some(bytes) = self
             .db
             .get(Self::binding_key(chat_id))
@@ -80,17 +83,22 @@ impl PersistentStore for SledStore {
             )));
         }
 
-        Ok(Some(value.agent_id))
+        Ok(Some(Binding {
+            agent_id: value.agent_id,
+            workspace: value.workspace,
+        }))
     }
 
     async fn set_session_binding(
         &self,
         chat_id: &ChatId,
         agent_id: &AgentId,
+        workspace: &WorkspacePath,
     ) -> Result<(), CoreError> {
         let value = SessionBindingValue {
             version: VALUE_VERSION,
             agent_id: agent_id.clone(),
+            workspace: workspace.clone(),
         };
         let bytes = serde_json::to_vec(&value).map_err(serialization_error)?;
         self.db
@@ -150,11 +158,17 @@ fn serialization_error(error: serde_json::Error) -> CoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deapbox_core::types::AgentId;
+    use std::path::PathBuf;
 
     fn open_temp_store() -> (tempfile::TempDir, SledStore) {
         let dir = tempfile::tempdir().expect("create temp dir");
         let store = SledStore::open(dir.path()).expect("open sled store");
         (dir, store)
+    }
+
+    fn ws(s: &str) -> WorkspacePath {
+        WorkspacePath(PathBuf::from(s))
     }
 
     #[tokio::test]
@@ -171,24 +185,32 @@ mod tests {
         let (_dir, store) = open_temp_store();
         let chat_id = ChatId("群聊-α".to_owned());
         let first_agent = AgentId("codex".to_owned());
+        let first_ws = ws("/ws/a");
         let second_agent = AgentId("opencode".to_owned());
+        let second_ws = ws("/ws/b");
 
         store
-            .set_session_binding(&chat_id, &first_agent)
+            .set_session_binding(&chat_id, &first_agent, &first_ws)
             .await
             .unwrap();
         assert_eq!(
             store.get_session_binding(&chat_id).await.unwrap(),
-            Some(first_agent)
+            Some(Binding {
+                agent_id: first_agent,
+                workspace: first_ws,
+            })
         );
 
         store
-            .set_session_binding(&chat_id, &second_agent)
+            .set_session_binding(&chat_id, &second_agent, &second_ws)
             .await
             .unwrap();
         assert_eq!(
             store.get_session_binding(&chat_id).await.unwrap(),
-            Some(second_agent)
+            Some(Binding {
+                agent_id: second_agent,
+                workspace: second_ws,
+            })
         );
     }
 
@@ -215,11 +237,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("create temp dir");
         let chat_id = ChatId("chat-reopen".to_owned());
         let agent_id = AgentId("codex".to_owned());
+        let workspace = ws("/ws/reopen");
 
         {
             let store = SledStore::open(dir.path()).expect("open sled store");
             store
-                .set_session_binding(&chat_id, &agent_id)
+                .set_session_binding(&chat_id, &agent_id, &workspace)
                 .await
                 .unwrap();
             store.set_resume_key(&chat_id, "resume-key").await.unwrap();
@@ -228,7 +251,10 @@ mod tests {
         let reopened = SledStore::open(dir.path()).expect("reopen sled store");
         assert_eq!(
             reopened.get_session_binding(&chat_id).await.unwrap(),
-            Some(agent_id)
+            Some(Binding {
+                agent_id,
+                workspace,
+            })
         );
         assert_eq!(
             reopened.get_resume_key(&chat_id).await.unwrap(),
