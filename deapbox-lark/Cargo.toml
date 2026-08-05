@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 deapbox-core = { path = "../deapbox-core" }
-open-lark = { workspace = true }
+openlark = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }

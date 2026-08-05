@@ -257,7 +257,7 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<(),
     }
 
     Err(CliError::InboundEventsUnavailable(
-        "the pinned open-lark WebSocket handler does not expose event payload forwarding yet; run --dry-run for startup validation or wire a real inbound source before starting the service",
+        "the pinned openlark WebSocket handler does not expose event payload forwarding yet; run --dry-run for startup validation or wire a real inbound source before starting the service",
     ))
 }
 
