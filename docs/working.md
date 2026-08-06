@@ -60,6 +60,19 @@
 
 ---
 
+### 2026-08-06 — TES-84：核心消息 Router MVP（task-per-message + OutputSink）
+
+**更改内容：**
+
+- `deapbox-core/src/router.rs`（从 48 行 `todo!()` stub 填到 ~130 行 impl）：`RouterImpl` 字段从 `_store`/`_agent_manager`/`_sink`（dead_code 占位）改为 `store`/`agent_manager`/`sink` 并启用。`route_user_message` 非阻塞实现五步：①`store.get_session_binding(chat) → Binding`（无绑定 → `SessionNotFound`，行为固定）；②`agent_manager.get_or_start(chat, binding) → Arc<dyn AgentSession>`；③`session.subscribe()`（**在 send 之前**，见 lesson #12）；④`session.send(text)`（非阻塞，`&self`）；⑤`tokio::spawn` 一个 task 收 `AgentEvent` 到 `OutputSink`，主循环立即返回 `TurnHandle`。
+- 新增私有 `run_turn_loop`（task 体）：`Normalized(e) → sink.consume`（best-effort，sink 失败不中断——仍要抓 `TurnEnd` 写 resume_key）；`TurnEnd{resume_key}` → 仅当 `Some(非空)` 写 `set_resume_key`（`None`/空串不覆盖既有 key，保 resume 链）+ `sink.on_turn_end` → 结束；`Exited(code)` / `Failed(err)` → `sink.on_error`（**不冒充完成**，不写 resume_key）；`Lagged(_)` 续收；`Closed` 视同 Exited 走 `on_error`。
+- `deapbox-core/src/types.rs`：`NormalizedEvent` 加 `PartialEq, Eq` derive（对标 `Binding`/`BotCommandResult`/`HealthStatus` 同款 derive-for-testability，让 Router 测试可断言输出顺序）。
+- 测试（~585 行，预算外）：7 个用例覆盖普通路由全流程 + 输出顺序、`TurnEnd` 写 resume_key、`Exited`/`Failed` 不写 resume_key 且走 `on_error`、未绑定 chat 返回 `SessionNotFound` 且不触达 manager、两 chat 并发不互阻、`TurnEnd{None}` 不覆盖既有 key、channel `Closed` 不冒充完成。fake 全套（`FakeStore`/`FakeManager`/`FakeSink`/`FakeSession` + `ClosingFakeSession` 模拟 channel 关闭）。
+
+**影响：** Stage 1 里程碑（TES-77）最后一块拼图就位。核心路由可在无 Lark、无真实 agent 环境完整测试；多 chat 并发不饿死（task-per-message）；EOF/进程退出不再冒充 TurnComplete（locked design Q2 落地）。验证：`cargo test --workspace`（72 测试全过，core 16 = 9 manager + 7 router）、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo fmt --check`。`deapbox-cli` 仍未装配 Router（Stage 2 MVP 是 console-only，TES-85 装配是后续）。
+
+---
+
 ---
 
 ## Lesson Learned
@@ -111,6 +124,10 @@ TES-86 原文写 `get_or_start -> Box<dyn AgentSession>` + 会话表 `Map<ChatId
 ### 11. 探针类 API 要前向兼容：探不到就按"新版本"默认
 
 `--print` 探针（旧 kimi 需它进非交互 print 模式，新版弃用）若 spawn 失败 / 超时，返回什么？返回 `true`（"加 --print"）会让新版 kimi 拿到未知 flag 报错；返回 `false`（"不加"）在旧版 kimi 上会进 TUI 挂死（但 idle-timeout 会兜）。**前向兼容的默认是"按新版行为"**——探不到就不加，错的代价由 idle-timeout 兑现，而不是由"未知 flag 崩溃"兑现。探针缓存首次结果，后续走快路径。**设计兼容探针时，先问"探不到时哪个默认的错可被安全网接管"，那个就是默认。**
+
+### 12. broadcast 订阅必须在 send 之前——首发事件会丢
+
+TES-84 Router 初版差点按 issue 描述的步骤顺序"3. send → 4. spawn task 里 subscribe"实现。但 `tokio::sync::broadcast` 只把消息投递给**订阅时已存在**的接收端：先 `send` 再 `subscribe`，agent 在 send 后立即吐的 `result`/首发事件会因无接收端而丢（broadcast `send` 在零接收端时返回 `Err`，agent 侧实现多半 `let _ = tx.send(...)` 忽略，事件蒸发）。正确顺序是 `subscribe() → send() → spawn(task 持 rx)`——订阅在 send 之前，事件缓冲在 channel 里，task 起跑后从 rx 漏出。**写事件流消费方时，永远先订后发；issue/PRD 里的步骤编号是逻辑描述不是执行顺序，broadcast 的订阅时机是语义边界。**
 
 ---
 
