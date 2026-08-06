@@ -75,7 +75,10 @@ pub struct UserMessage {
 ///
 /// 注意：`TurnComplete` 已移除（turn 结束是 `AgentEvent::TurnEnd`，由 agent 自己说，
 /// 见 working.md lesson #2）。
-#[derive(Debug, Clone)]
+///
+/// `PartialEq, Eq` 让 TES-84 Router 测试可断言输出顺序（对标 `Binding` /
+/// `BotCommandResult` / `HealthStatus` 同款 derive-for-testability 惯用法）。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NormalizedEvent {
     /// 最终回复文本
     Text(String),
