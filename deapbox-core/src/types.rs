@@ -22,7 +22,7 @@ pub struct UserId(pub String);
 
 // ============ Agent 类型 ============
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AgentKind {
     Opencode,
     Codex,
@@ -108,15 +108,39 @@ pub enum AgentEvent {
 
 // ============ 命令 ============
 
-/// 飞书消息中识别的 bot 命令
-///
-/// 注意：变体语义将在 TES-82（AgentManager BotCommand 处理）中按
-/// `/new` `/switch agent <id>` `/switch workspace <path>` `/session` 重画。
+/// 飞书消息中识别的 bot 命令。
 #[derive(Debug, Clone)]
 pub enum BotCommand {
-    NewSession(Option<String>),
-    ListSessions,
-    SwitchSession(AgentSessionId),
+    /// `/new`：清当前 chat 的 resume key，并丢弃活跃会话。
+    New,
+    /// `/switch agent <id>`：保留当前 workspace，切到另一个 agent。
+    SwitchAgent(AgentId),
+    /// `/switch workspace <path>`：保留当前 agent，切到另一个 workspace。
+    SwitchWorkspace(WorkspacePath),
+    /// `/session`：展示当前 binding、resume key 与活跃会话状态。
+    Session,
+}
+
+/// Bot command handling result for operator-facing rendering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BotCommandResult {
+    NewSession {
+        chat_id: ChatId,
+    },
+    SwitchedAgent {
+        chat_id: ChatId,
+        binding: Binding,
+    },
+    SwitchedWorkspace {
+        chat_id: ChatId,
+        binding: Binding,
+    },
+    Session {
+        chat_id: ChatId,
+        binding: Option<Binding>,
+        resume_key: Option<String>,
+        active: bool,
+    },
 }
 
 // ============ 健康状态 ============
