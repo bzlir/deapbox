@@ -48,6 +48,18 @@
 **影响：** （可选，说明影响的 crate / 子任务 / 行为变化）
 -->
 
+### 2026-08-06 — TES-87：KimiCode AgentSession（进程-per-turn + --resume + stream-json）
+
+**更改内容：**
+
+- `deapbox-agent/src/kimi_code.rs`（从空 stub 填到 ~570 行，impl 157 行）：`KimiDriver`（工厂，`start_session(resume, ws)` 装配参数不 spawn）+ `KimiSession: AgentSession`（**每 `send` spawn 一个新进程**，进程退出 → `AgentEvent::Exited`）。`build_turn_args`：`--output-format stream-json` + `--print`（探针测支持）+ `--resume <key>`（当 resume 非空）+ `--prompt <text>`。stdout 走 `dispatch_ndjson_line` + `shared_agent_event`（result → `TurnEnd{resume_key}`）；stderr 兜底抓 resume key（regex，容忍 `session_id`/`sessionId`/`resume_key` 变体）。跨 turn 复用同一 `broadcast::Sender`（channel 连续性）+ resume key 链（turn1 的 result key → turn2 的 `--resume`）。`interrupt()` = SIGINT 当前 turn pid；`close()` = SIGTERM + 置 `alive=false`。idle-timeout（默认 300s）作 dead-agent 安全网：stdout 连续静默 → kill + `Failed`。
+- `deapbox-agent/src/protocol.rs`：新增 `spawn_stdio_with_stderr`（stderr piped + `StdioHandles.stderr: Option<...>`），`spawn_stdio` 保持 stderr null（claude 不变）。修了 Review 指出的“声称改了 stderr 实际仍 null”——现并有测试 `spawn_stdio_with_stderr_captures_stderr` 证明 stderr 真能读到。
+- 未触 `claude_code.rs`（TES-81 非目标）；assistant 内容块解析在 kimi 侧复制一份（镜像 Anthropic 风格，刻意不抽进 adapter 以免动 claude，后续可统一）。
+
+**影响：** KimiCode 现可与 ClaudeCode 共享 `AgentSession` trait，Router/Manager 无需区分生命周期差异。`AgentKind::KimiCode` 有了真实实现。验证：`cargo test --workspace`（28 agent 测试全过）、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo fmt --check`。
+
+---
+
 ---
 
 ## Lesson Learned
@@ -91,6 +103,14 @@ TES-86 原文写 `get_or_start -> Box<dyn AgentSession>` + 会话表 `Map<ChatId
 ### 9. 把错误塞进事件流，错误类型就得 Clone
 
 为了让 `AgentEvent::Failed(CoreError)` 走 `tokio::sync::broadcast`（TES-81 要测 `subscribe()` 多接收端不丢事件），`AgentEvent` 要 `Clone`，倒逼 `CoreError: Clone`。但 `CoreError::Io(#[from] std::io::Error)` 卡住——`std::io::Error` 非 `Clone`。解法不是给 `CoreError` 套 `Arc` 也不是弃用 `#[from]`，而是认清：错误一旦进**事件流**（vs 进 `Result` 返回值），它的角色就从"一次返回的对象"变成"被多次消费的值"，天生需要 `Clone`。把 `Io` 改成 `Io(String)`（错误信息字符串化）是正确的取舍——存的是"错误的描述"而非"错误对象本身"。**`Result<E>` 里的错误可以不 `Clone`；`event stream` 里的错误必须 `Clone`，设计 trait 时先想清错误走哪条路。**
+
+### 10. 同一个 trait 方法，per-kind 语义可以不同——在文档里说清，别用代码糊
+
+`AgentSession::alive()` 在 ClaudeCode（长驻）里 = "那个进程还在跑"；在 KimiCode（进程-per-turn）里 turn 间本就无进程，若也绑进程，host 会误判会话 dead 去 respawn，砸掉 resume key 链。解法不是加状态机区分"turn 间空闲" vs "会话 dead"，而是认清：`alive()` 的契约是"dead-agent 安全网，非 turn 边界探测器"（见 trait 文档），per-kind 可以把它映射到各自"会话是否可用"的语义——kimi 里 = "未 close"。turn 级卡死走 idle-timeout + `Failed`/`Exited`（事件流里），不走 `alive()`。**trait 定契约、per-kind 定语义时，允许同一方法在不同实现里映射到不同内部状态，但必须在文档里写清差异，别用一个布尔的宏实现把语义抹平——抹平的代价是错误的 host 决策。**
+
+### 11. 探针类 API 要前向兼容：探不到就按"新版本"默认
+
+`--print` 探针（旧 kimi 需它进非交互 print 模式，新版弃用）若 spawn 失败 / 超时，返回什么？返回 `true`（"加 --print"）会让新版 kimi 拿到未知 flag 报错；返回 `false`（"不加"）在旧版 kimi 上会进 TUI 挂死（但 idle-timeout 会兜）。**前向兼容的默认是"按新版行为"**——探不到就不加，错的代价由 idle-timeout 兑现，而不是由"未知 flag 崩溃"兑现。探针缓存首次结果，后续走快路径。**设计兼容探针时，先问"探不到时哪个默认的错可被安全网接管"，那个就是默认。**
 
 ---
 
