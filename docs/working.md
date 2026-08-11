@@ -71,9 +71,83 @@
 
 **影响：** Stage 1 里程碑（TES-77）最后一块拼图就位。核心路由可在无 Lark、无真实 agent 环境完整测试；多 chat 并发不饿死（task-per-message）；EOF/进程退出不再冒充 TurnComplete（locked design Q2 落地）。验证：`cargo test --workspace`（72 测试全过，core 16 = 9 manager + 7 router）、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo fmt --check`。`deapbox-cli` 仍未装配 Router（Stage 2 MVP 是 console-only，TES-85 装配是后续）。
 
----
+### 2026-08-07 — IVA-11 (C0)：setup 子命令前置清理
+
+**更改内容：**
+
+- 删除 `scripts/setup.sh` 与空的 `scripts/` 目录。setup 路径统一由 Rust 子命令 `deapbox setup` 承担（对标 cc-connect `feishu setup`），不再维护 shell 入口。
+- `config.toml.example` 顶部说明更新：从「交互式 `./scripts/setup.sh`」改为指向 `deapbox setup` / `deapbox setup bind --app id:secret`，并提示 `cp config.toml.example config.toml` 作为手动备选。
+- 未触代码（仅文档 + 文件删除）；`cargo build --workspace` / `cargo test --workspace` 不受影响。
+
+**影响：** C1（IVA-12）可在干净的代码基础上动 CLI 子命令重构，无两套入口要维护。本轮迭代目标见 parent issue IVA-10。
 
 ---
+
+### 2026-08-07 — IVA-12 (C1)：CLI 子命令骨架 + BIND 模式
+
+**更改内容：**
+
+- `deapbox-cli/Cargo.toml`：加 `reqwest 0.12`（rustls-tls，HTTP 调飞书 OAuth）+ `toml_edit 0.22`（保序写回 config.toml）。
+- `deapbox-cli/src/setup/`（新模块，对标 `cc-connect/cmd/cc-connect/feishu.go:86-235`）：mod.rs / args.rs / bind.rs / new.rs / error.rs。详见 IVA-12 issue comment「落地变更记录」。
+- `deapbox-cli/src/lib.rs`：加 `pub mod setup` + `Command` enum + `parse_command` dispatch + `CliError::Setup(#[from] SetupError)`。
+- `deapbox-store/src/config.rs`：`RawConfig::agents` 改 `#[serde(default)]`（让 BIND 写出的「只有 [lark]」配置也能通过 `--check-config`）。
+- 测试：args 11 + bind 8 + dispatch 8 = +27。workspace 103 全过。
+
+**影响：** `deapbox setup bind --app cli_xxx:sec_xxx` 可用（凭证校验 + 写回 + `--check-config` 通过）。NEW 模式留给 IVA-13（C2）。clippy / fmt 干净。
+
+---
+
+### 2026-08-07 — IVA-13 (C2)：NEW 模式 QR onboarding + Auto-detect
+
+**更改内容：**
+
+- `deapbox-cli/Cargo.toml`：加 `qrcode = "0.14"`（终端 QR + 自写 PNG encoder，无 image 依赖）。
+- `deapbox-cli/src/setup/oauth.rs`（新增，对标 `cc-connect/cmd/cc-connect/feishu.go:534-674` 的 `runRegistrationFlow` + `registrationCall`）：
+  - `InitResponse` / `BeginResponse` / `PollResponse` / `PollUserInfo` 类型
+  - `OAuthClient` trait + `HttpOAuthClient`（reqwest form POST + 15s timeout + debug 日志）
+  - `run_registration_flow<C, F>`：init → begin → poll 循环；`tenant_brand == "lark"` 切域名继续；`slow_down` 加 interval、`access_denied` / `expired_token` 报错；deadline = `min(--timeout, expire_in)`；用 `on_qr: FnMut(&str)` 回调把 `verification_uri_complete` 渲染权交回调用方
+  - `FakeOAuthClient` 测试 impl + 7 个 oauth.rs 单测（happy path / unsupported method / access_denied / expired_token / slow_down → success / incomplete begin / unknown error）
+- `deapbox-cli/src/setup/qr.rs`（新增）：
+  - `QrRenderer` trait + `AnsiQrRenderer` 生产实现
+  - `render_terminal`：用 `QrCode::to_colors()` + 4 圈 quiet zone + `██` / `  ` 双字符模块（对标 `cc-connect/feishu.go:685-700`）
+  - `render_png`：自写 1-bit PNG encoder（`write_minimal_png` + `rgb_to_png_bytes` + `crc32` + `adler32` + `zlib_stored_deflate`），无 `image` crate 依赖；CRC 参考值 `0xCBF43926`、Adler `0x11E60398` 测试覆盖
+  - 4 个 qr.rs 单测（module 渲染 / PNG 签名 / CRC 参考值 / Adler 参考值）
+- `deapbox-cli/src/setup/new.rs`（重写，对标 `cc-connect/feishu.go:163-184`）：
+  - `run_new`：生产入口（默认 `HttpOAuthClient` + `AnsiQrRenderer`）
+  - `run_new_with<C, R>`：注入入口（测试用 fake）
+  - 流程：打印引导 → 调 `run_registration_flow`（在 `on_qr` 回调里画 QR + 可选 PNG）→ 拿到 `RegistrationResult` → 复用 `bind::write_back_config` 写回 config.toml
+  - 4 个 new.rs 单测（写回成功 / --qr-image 保存 PNG / onboarding 失败不写 / store load 回环）
+- `deapbox-cli/src/setup/args.rs`：新增 `SetupCommand::Auto` variant + `AutoArgs { kind, bind, new }` + `AutoKind { Bind, New }`；`parse_args` 无显式子命令时走 Auto-detect（有 `--app`/`--app-id`/`--app-secret` 任一 → Bind，否则 New，对标 IVA-10 spec）；`parse_bind` / `parse_new` 重构为 `parse_bind_inner` / `parse_new_inner` 返回具体 args；`usage()` 加 auto-detect 行；新增 4 个 args Auto 单测（无参→New / --app→Bind / --app-id+secret→Bind / --config+--timeout→New）
+- `deapbox-cli/src/setup/mod.rs`：re-export `AutoArgs` / `AutoKind`；`run` dispatch 加 `SetupCommand::Auto` 分支（按 `auto.kind` 调 `bind::run_bind` 或 `new::run_new`，期望 `Option` 已 Some）
+- `deapbox-cli/src/lib.rs`：C1 留下的 `run_from_args_setup_new_returns_not_implemented` dispatch test 重写为 `parse_command_routes_setup_new_to_new_variant`（C2 后 NEW 已实现不再返 NotImplemented，改测路由不真调飞书 OAuth，避免网络副作用）；新增 `parse_command_setup_with_no_args_returns_auto_new` 反映 Auto-detect
+- `docs/working.md`：追加 IVA-13 changelog 条目
+- 测试：setup::oauth::tests 7 + setup::qr::tests 4 + setup::new::tests 4 + setup::args::tests 新增 4（Auto）+ lib dispatch_tests 改 1 = +20 测试。workspace 全过 122（C1 后 103 + 19 净增，含 1 个原 NotImplemented 测试改写）。
+
+**影响：** 用户现可跑 `deapbox setup new`（或 `deapbox setup` 无参）触发飞书 OAuth 设备码流程：终端画出 QR，扫码后飞书自动创建 PersonalAgent 应用，凭证写回 `config.toml`。Auto-detect 模式落地 IVA-10 的"无参 setup → 有 --app 走 bind / 否则 new"目标。验证 smoke：`deapbox setup new --timeout 3` 真实调飞书 `accounts.feishu.cn/oauth/v1/app/registration` init + begin 成功，终端渲染出 QR 码（用 `QrCode::to_colors()` + 自写 ANSI），无人扫码 3 秒后 `timed out waiting for QR onboarding result` 退出。`cargo test --workspace` 122 过；`cargo clippy --workspace --all-targets -- -D warnings` 干净；`cargo fmt --check` 干净。
+
+---
+
+
+
+**更改内容：**
+
+- `deapbox-cli/Cargo.toml`：加 `reqwest 0.12`（rustls-tls，HTTP 调飞书 OAuth）+ `toml_edit 0.22`（保序写回 config.toml）。
+- `deapbox-cli/src/setup/`（新模块，对标 `cc-connect/cmd/cc-connect/feishu.go:86-235`）：
+  - `mod.rs` — `setup::run` dispatch（bind/new/help）；`setup::parse_args` 入口
+  - `args.rs` — `SetupCommand` / `BindArgs` / `NewArgs` + `parse_args` + `parse_app_pair` + `usage`（对标 `parseAppPair:420-431`、`printFeishuUsage:347-378`）
+  - `bind.rs` — BIND 模式：`CredentialValidator` trait + `HttpCredentialValidator`（先 feishu 域名，OAuth 拒绝不 fallback，网络错误才试 lark 兜底，对标 `validateAppCredentials:464-532`）+ `run_bind` / `run_bind_with` + `write_back_config`（`toml_edit::DocumentMut` 保序 merge `[lark]` 段，存在则更新 app_id/app_secret，不存在则 append；保留 `[[agents]]` / 注释）
+  - `new.rs` — NEW 模式占位（返回 `NotImplemented`，C2/IVA-13 实现）
+  - `error.rs` — `SetupError` enum（InvalidArgs / Http / OAuth {code,msg} / WriteConfig / NotImplemented）
+- `deapbox-cli/src/lib.rs`：加 `pub mod setup;` + `pub use setup::SetupError`；新增 `Command` enum（Run/Setup）+ `parse_command` 函数（识别 `setup` 前缀 dispatch，否则 fallthrough 到 `CliOptions::parse`）；`run_from_args` 重构为 dispatch → `run_service`（旧 body 抽出）；`CliError` 加 `Setup(#[from] SetupError)` variant；`usage()` 加 setup 第二行。
+- `deapbox-store/src/config.rs`：`RawConfig::agents` 改 `#[serde(default)]`（让 setup bind 写出的「只有 [lark]」配置也能通过 `--check-config`，符合「先 setup 再加 agent」的真实用户流程）+ 新增 `test_parse_lark_only_config_without_agents`。
+- 测试：setup::args::tests 11 用例（参数解析全覆盖）+ setup::bind::tests 8 用例（写回 round-trip / merge / 不写文件 / 跨平台 colons / store load 回环）+ dispatch_tests 8 用例（parse_command 路由 + run_from_args setup 子命令）。共 +27 测试，全 workspace 103 测试全过。
+- 验证 smoke：`deapbox setup bind --app bad:bad` 真实调飞书 API 返回 `code=10003 invalid param` 且不写文件；`deapbox setup new` 返回 NotImplemented；`deapbox --help` 双行 usage；旧 `deapbox --check-config`/`--dry-run` 行为不变。
+
+**影响：** 用户现可用 `deapbox setup bind --app cli_xxx:sec_xxx` 完成已有飞书 bot 的初始化（凭证校验 + 写回 config.toml + 后续 `--check-config` 通过）。NEW 模式（QR onboarding）留给 IVA-13。`cargo test --workspace` 103 过；`cargo clippy --workspace --all-targets -- -D warnings` 干净；`cargo fmt --check` 干净。
+
+---
+
+
 
 ## Lesson Learned
 

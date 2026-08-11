@@ -13,7 +13,11 @@
 
 # Local personal config (not project-level)
 .claude/
+skills-lock.json
 
 # Environment files
 .env
 .env.local
+
+# Local runtime config (contains secrets, not committed)
+config.toml

@@ -7,6 +7,10 @@ use deapbox_store::config::{load_config, ConfigError};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
+pub mod setup;
+
+pub use setup::SetupError;
+
 const OPERATOR_HELP: &str = "/chats | /use <chat_id> | /send <chat_id> <text> | /quit | /exit";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,7 +22,7 @@ pub struct CliOptions {
 
 impl CliOptions {
     pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, CliError> {
-        let mut config_path = PathBuf::from("deapbox.toml");
+        let mut config_path = PathBuf::from("config.toml");
         let mut check_config = false;
         let mut dry_run = false;
         let mut args = args.into_iter();
@@ -67,6 +71,26 @@ pub enum CliError {
     InboundEventsUnavailable(&'static str),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("setup error: {0}")]
+    Setup(#[from] SetupError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Command {
+    Run(CliOptions),
+    Setup(setup::SetupCommand),
+}
+
+pub fn parse_command(args: impl IntoIterator<Item = String>) -> Result<Command, CliError> {
+    let mut iter = args.into_iter().peekable();
+    if let Some(first) = iter.peek() {
+        if first == "setup" {
+            iter.next();
+            let rest: Vec<String> = iter.collect();
+            return Ok(Command::Setup(setup::parse_args(rest)?));
+        }
+    }
+    Ok(Command::Run(CliOptions::parse(iter)?))
 }
 
 #[derive(Debug, Default)]
@@ -239,7 +263,13 @@ pub fn load_checked_config(path: &Path) -> Result<AppConfig, CliError> {
 }
 
 pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<(), CliError> {
-    let options = CliOptions::parse(args)?;
+    match parse_command(args)? {
+        Command::Run(opts) => run_service(opts).await,
+        Command::Setup(cmd) => setup::run(cmd).await,
+    }
+}
+
+async fn run_service(options: CliOptions) -> Result<(), CliError> {
     let config = load_checked_config(&options.config_path)?;
 
     if options.check_config {
@@ -321,7 +351,86 @@ async fn write_line<W: AsyncWrite + Unpin>(writer: &mut W, line: &str) -> Result
 }
 
 fn usage() -> String {
-    "usage: deapbox [--config <path>] [--check-config] [--dry-run]".to_string()
+    "usage: deapbox [--config <path>] [--check-config] [--dry-run]\n       deapbox setup <command> [options]  (run `deapbox setup --help` for details)".to_string()
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+
+    #[test]
+    fn parse_command_routes_setup_subcommand() {
+        let cmd = parse_command(["setup".into(), "--help".into()]).unwrap();
+        match cmd {
+            Command::Setup(setup::SetupCommand::Help) => {}
+            other => panic!("expected Setup::Help, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_command_routes_setup_bind() {
+        let cmd =
+            parse_command(["setup".into(), "bind".into(), "--app".into(), "x:y".into()]).unwrap();
+        match cmd {
+            Command::Setup(setup::SetupCommand::Bind(b)) => {
+                assert_eq!(b.app_id, "x");
+                assert_eq!(b.app_secret, "y");
+            }
+            other => panic!("expected Setup::Bind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_command_routes_setup_new() {
+        let cmd = parse_command(["setup".into(), "new".into()]).unwrap();
+        assert!(matches!(cmd, Command::Setup(setup::SetupCommand::New(_))));
+    }
+
+    #[test]
+    fn parse_command_falls_through_to_run_when_no_setup_prefix() {
+        let cmd = parse_command(["--check-config".into()]).unwrap();
+        match cmd {
+            Command::Run(opts) => assert!(opts.check_config),
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_command_run_with_config_path_unchanged() {
+        let cmd = parse_command(["--config".into(), "/tmp/x.toml".into()]).unwrap();
+        match cmd {
+            Command::Run(opts) => assert_eq!(opts.config_path, PathBuf::from("/tmp/x.toml")),
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_command_setup_with_no_args_returns_auto_new() {
+        // IVA-10: `deapbox setup`（无参）→ auto-detect → NEW（无 --app）
+        let cmd = parse_command(["setup".into()]).unwrap();
+        match cmd {
+            Command::Setup(setup::SetupCommand::Auto(a)) => {
+                assert_eq!(a.kind, setup::AutoKind::New);
+            }
+            other => panic!("expected Setup::Auto(New), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_from_args_setup_help_prints_usage_and_succeeds() {
+        let result = run_from_args(["setup".into(), "--help".into()]).await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn parse_command_routes_setup_new_to_new_variant() {
+        // C2 后 NEW 模式真实现，不再返 NotImplemented；这里只测路由不真调飞书 OAuth。
+        let cmd = parse_command(["setup".into(), "new".into()]).unwrap();
+        match cmd {
+            Command::Setup(setup::SetupCommand::New(_)) => {}
+            other => panic!("expected Setup::New, got {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -530,7 +639,7 @@ command = "codex"
     fn default_config_path_is_cwd_relative() {
         let options = CliOptions::parse(Vec::<String>::new()).unwrap();
 
-        assert_eq!(options.config_path, PathBuf::from("deapbox.toml"));
+        assert_eq!(options.config_path, PathBuf::from("config.toml"));
     }
 
     fn message(chat_id: &str, sender: &str, msg_id: &str, text: &str) -> UserMessage {

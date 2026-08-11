@@ -13,6 +13,7 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize)]
 struct RawConfig {
     lark: RawLarkConfig,
+    #[serde(default)]
     agents: Vec<RawAgentConfig>,
     sessions: Option<Vec<RawSessionBinding>>,
 }
@@ -155,6 +156,21 @@ command = "opencode"
         assert_eq!(config.agents.len(), 1);
         assert_eq!(config.agents[0].id.0, "opencode-main");
         assert_eq!(config.agents[0].kind, AgentKind::Opencode);
+    }
+
+    #[test]
+    fn test_parse_lark_only_config_without_agents() {
+        let toml = r#"
+[lark]
+app_id = "cli_xxx"
+app_secret = "secret_xxx"
+"#;
+
+        let raw: RawConfig = toml::from_str(toml).unwrap();
+        let config = raw.into_domain().unwrap();
+        assert_eq!(config.agents.len(), 0);
+        assert_eq!(config.sessions.len(), 0);
+        assert_eq!(config.lark.app_id, "cli_xxx");
     }
 
     #[test]
