@@ -25,15 +25,24 @@ where
 {
     println!("=== deapbox setup: NEW 模式（QR onboarding）===");
     println!();
-    println!("请使用飞书 / Lark 手机 App 扫码完成机器人创建与授权。");
-    println!("（扫码后飞书会自动创建一个 PersonalAgent 应用并返回凭证。）");
+    println!("请使用飞书 / Lark 手机 App 完成机器人创建与授权。");
+    println!("（飞书会自动创建一个 PersonalAgent 应用并返回凭证。）");
     println!();
 
     let result = run_registration_flow(oauth, args.timeout_seconds, args.debug, |url| {
-        if let Err(err) = renderer.render_terminal(url) {
-            eprintln!("warning: failed to render QR to terminal: {err}");
-            eprintln!("(QR URL: {url})");
+        // 总是先打 URL（对标 cc-connect/feishu.go:571-572），
+        // 让无 TTY / 无 Unicode 渲染 / 窄终端 / CI 等场景都能复制链接到手机浏览器打开。
+        println!("授权链接（复制到手机浏览器或飞书 App 打开）：");
+        println!("  {url}");
+        println!();
+
+        if !args.no_qr {
+            if let Err(err) = renderer.render_terminal(url) {
+                eprintln!("warning: failed to render QR to terminal: {err}");
+                eprintln!("（可用上方链接代替扫码）");
+            }
         }
+
         if let Some(path) = &args.qr_image {
             if let Err(err) = renderer.render_png(url, path) {
                 eprintln!("warning: failed to save QR image: {err}");
@@ -98,6 +107,7 @@ mod tests {
             timeout_seconds: 30,
             qr_image: None,
             debug: false,
+            no_qr: false,
         }
     }
 
@@ -215,5 +225,25 @@ mod tests {
         let loaded = deapbox_store::config::load_config(dir.path().join("config.toml")).unwrap();
         assert_eq!(loaded.lark.app_id, "cli_new");
         assert_eq!(loaded.lark.app_secret, "sec_new");
+    }
+
+    #[tokio::test]
+    async fn new_with_no_qr_skips_terminal_render() {
+        let dir = tempdir().unwrap();
+        let mut args = new_args(dir.path());
+        args.no_qr = true;
+        let client = happy_client();
+        let renderer = CapturingRenderer {
+            terminal_calls: Arc::new(Mutex::new(Vec::new())),
+            png_calls: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        run_new_with(args, &client, &renderer).await.unwrap();
+
+        // 链接已通过 println 输出，但 QR 不应被渲染
+        assert!(renderer.terminal_calls.lock().unwrap().is_empty());
+        // config 仍正常写回
+        let written = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(written.contains("cli_new"));
     }
 }

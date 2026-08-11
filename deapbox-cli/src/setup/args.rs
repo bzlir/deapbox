@@ -30,6 +30,7 @@ pub struct NewArgs {
     pub timeout_seconds: u64,
     pub qr_image: Option<PathBuf>,
     pub debug: bool,
+    pub no_qr: bool,
 }
 
 /// `deapbox setup`（无显式子命令）的 auto-detect 模式。
@@ -173,6 +174,7 @@ fn parse_new_inner(args: Vec<String>) -> Result<NewArgs, SetupError> {
     let mut timeout_seconds: u64 = 600;
     let mut qr_image: Option<PathBuf> = None;
     let mut debug = false;
+    let mut no_qr = false;
 
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
@@ -202,6 +204,7 @@ fn parse_new_inner(args: Vec<String>) -> Result<NewArgs, SetupError> {
                 qr_image = Some(PathBuf::from(v));
             }
             "--debug" => debug = true,
+            "--no-qr" => no_qr = true,
             "-h" | "--help" => return Err(SetupError::InvalidArgs(usage())),
             other => {
                 return Err(SetupError::InvalidArgs(format!(
@@ -217,6 +220,7 @@ fn parse_new_inner(args: Vec<String>) -> Result<NewArgs, SetupError> {
         timeout_seconds,
         qr_image,
         debug,
+        no_qr,
     })
 }
 
@@ -260,6 +264,7 @@ new options:
   --config <path>            Target config file (default: config.toml)
   --timeout <seconds>        QR onboarding timeout (default: 600)
   --qr-image <path>          Save QR code as PNG (default: terminal only)
+  --no-qr                    Skip terminal QR rendering; print URL only (for headless/CI)
   --debug                    Print onboarding debug logs
 
 examples:
@@ -428,6 +433,7 @@ mod tests {
                 assert_eq!(n.timeout_seconds, 600);
                 assert_eq!(n.qr_image, None);
                 assert!(!n.debug);
+                assert!(!n.no_qr);
             }
             other => panic!("expected New, got {other:?}"),
         }
@@ -444,6 +450,7 @@ mod tests {
             "--qr-image",
             "/tmp/qr.png",
             "--debug",
+            "--no-qr",
         ]))
         .unwrap();
         match cmd {
@@ -452,6 +459,7 @@ mod tests {
                 assert_eq!(n.timeout_seconds, 120);
                 assert_eq!(n.qr_image, Some(PathBuf::from("/tmp/qr.png")));
                 assert!(n.debug);
+                assert!(n.no_qr);
             }
             other => panic!("expected New, got {other:?}"),
         }
