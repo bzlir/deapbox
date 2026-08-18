@@ -1,3 +1,5 @@
-// deapbox-store — 持久化存储
+//! deapbox-store — TOML config + (Stage 3) sled persistence.
+
 pub mod config;
-pub mod store;
+
+pub use config::{load_config, ConfigError};

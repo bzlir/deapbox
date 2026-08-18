@@ -1,10 +1,12 @@
-//! Inbound Lark event parsing and forwarding.
+//! Inbound Lark event parsing — `im.message.receive_v1` → `UserMessage`.
+//!
+//! Stage 1: text messages only. Non-text (image/post/file) are rejected with
+//! `UnsupportedMessageType` and logged + dropped by the caller (ADR-0005).
+//! `attachments` is always `vec![]` in Stage 1 — the `Attachment::Image`
+//! shape is reserved for Stage 2 (ADR-0003).
 
 use deapbox_core::types::{ChatId, UserId, UserMessage};
 use serde::Deserialize;
-use tokio::sync::mpsc;
-
-use crate::types::InboundTextMessage;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LarkEventError {
@@ -18,30 +20,13 @@ pub enum LarkEventError {
     InvalidEventPayload(serde_json::Error),
     #[error("invalid Lark text message content: {0}")]
     InvalidTextContent(serde_json::Error),
-    #[error("failed to forward Lark event to console: {0}")]
-    Forward(String),
 }
 
-#[derive(Debug)]
-pub struct LarkEventBridge {
-    tx: mpsc::Sender<UserMessage>,
-}
-
-impl LarkEventBridge {
-    pub fn new(tx: mpsc::Sender<UserMessage>) -> Self {
-        Self { tx }
-    }
-
-    pub async fn handle_event_payload(&self, payload: &[u8]) -> Result<(), LarkEventError> {
-        let message = parse_text_message(payload)?;
-        self.tx
-            .send(message.into_user_message())
-            .await
-            .map_err(|err| LarkEventError::Forward(err.to_string()))
-    }
-}
-
-pub fn parse_text_message(payload: &[u8]) -> Result<InboundTextMessage, LarkEventError> {
+/// Parse an `im.message.receive_v1` event payload into a `UserMessage`.
+///
+/// `payload` is the raw JSON bytes forwarded by the openlark WS client.
+/// Non-text messages and missing required fields return `LarkEventError`.
+pub fn parse_text_message(payload: &[u8]) -> Result<UserMessage, LarkEventError> {
     let event: LarkEventEnvelope =
         serde_json::from_slice(payload).map_err(LarkEventError::InvalidEventPayload)?;
 
@@ -60,21 +45,18 @@ pub fn parse_text_message(payload: &[u8]) -> Result<InboundTextMessage, LarkEven
     let text: TextContent = serde_json::from_str(&event.event.message.content)
         .map_err(LarkEventError::InvalidTextContent)?;
 
-    Ok(InboundTextMessage {
+    Ok(UserMessage {
         chat_id: ChatId(required(
             event.event.message.chat_id,
             "event.message.chat_id",
         )?),
-        message_id: event.event.message.message_id,
         sender: UserId(required(
             event.event.sender.sender_id.open_id,
             "event.sender.sender_id.open_id",
         )?),
         text: text.text,
-        timestamp_ms: parse_timestamp_ms(
-            &event.event.message.create_time,
-            event.header.create_time,
-        ),
+        msg_id: event.event.message.message_id,
+        attachments: vec![], // Stage 1: always empty; Stage 2 fills from image messages
     })
 }
 
@@ -82,14 +64,6 @@ fn required(value: Option<String>, field: &'static str) -> Result<String, LarkEv
     value
         .filter(|text| !text.is_empty())
         .ok_or(LarkEventError::MissingField(field))
-}
-
-fn parse_timestamp_ms(message_time: &str, header_time: Option<String>) -> i64 {
-    message_time
-        .parse()
-        .ok()
-        .or_else(|| header_time.and_then(|time| time.parse().ok()))
-        .unwrap_or_default()
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,8 +75,6 @@ struct LarkEventEnvelope {
 #[derive(Debug, Deserialize)]
 struct LarkEventHeader {
     event_type: String,
-    #[serde(default)]
-    create_time: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -126,8 +98,6 @@ struct LarkMessage {
     message_id: String,
     #[serde(default)]
     chat_id: Option<String>,
-    #[serde(default)]
-    create_time: String,
     message_type: String,
     content: String,
 }
@@ -143,63 +113,102 @@ mod tests {
     use serde_json::json;
     use serde_json::Value;
 
+    // ============ V6.1: legal text message parses to UserMessage ============
+
     #[test]
-    fn parses_text_messages_with_distinct_chat_ids() {
-        let a = fixture("oc_a", "ou_same_user", "om_a", "hello A", "111");
-        let b = fixture("oc_b", "ou_same_user", "om_b", "hello B", "222");
+    fn v6_1_legal_text_message_parses_to_user_message() {
+        let payload = fixture("oc_a", "ou_sender", "om_1", "hello world", "111");
+        let msg = parse_text_message(payload.to_string().as_bytes()).unwrap();
 
-        let first = parse_text_message(a.to_string().as_bytes()).unwrap();
-        let second = parse_text_message(b.to_string().as_bytes()).unwrap();
-
-        assert_eq!(first.chat_id, ChatId("oc_a".to_string()));
-        assert_eq!(first.sender, UserId("ou_same_user".to_string()));
-        assert_eq!(first.text, "hello A");
-        assert_eq!(first.timestamp_ms, 111);
-        assert_eq!(second.chat_id, ChatId("oc_b".to_string()));
-        assert_eq!(second.sender, UserId("ou_same_user".to_string()));
-        assert_eq!(second.text, "hello B");
-        assert_eq!(second.timestamp_ms, 222);
+        assert_eq!(msg.chat_id, ChatId("oc_a".to_owned()));
+        assert_eq!(msg.sender, UserId("ou_sender".to_owned()));
+        assert_eq!(msg.text, "hello world");
+        assert_eq!(msg.msg_id, "om_1");
+        assert!(msg.attachments.is_empty());
     }
 
+    // ============ V6.2: non-text message is rejected ============
+
     #[test]
-    fn rejects_missing_chat_id() {
-        let mut value = fixture("oc_a", "ou_sender", "om_a", "hello", "111");
-        value["event"]["message"]["chat_id"] = Value::Null;
+    fn v6_2_non_text_message_rejected_with_unsupported_message_type() {
+        let mut payload = fixture("oc_a", "ou_sender", "om_1", "ignored", "111");
+        payload["event"]["message"]["message_type"] = json!("image");
 
-        let err = parse_text_message(value.to_string().as_bytes()).unwrap_err();
+        let err = parse_text_message(payload.to_string().as_bytes()).unwrap_err();
+        assert!(matches!(err, LarkEventError::UnsupportedMessageType(_)));
+    }
 
+    // ============ V6.3: missing chat_id is rejected ============
+
+    #[test]
+    fn v6_3_missing_chat_id_rejected_with_missing_field() {
+        let mut payload = fixture("oc_a", "ou_sender", "om_1", "hello", "111");
+        payload["event"]["message"]["chat_id"] = Value::Null;
+
+        let err = parse_text_message(payload.to_string().as_bytes()).unwrap_err();
         assert!(matches!(
             err,
             LarkEventError::MissingField("event.message.chat_id")
         ));
     }
 
+    // ============ V6.4: missing sender.open_id is rejected ============
+
     #[test]
-    fn rejects_non_text_message() {
-        let mut value = fixture("oc_a", "ou_sender", "om_a", "ignored", "111");
-        value["event"]["message"]["message_type"] = json!("image");
+    fn v6_4_missing_sender_open_id_rejected_with_missing_field() {
+        let mut payload = fixture("oc_a", "ou_sender", "om_1", "hello", "111");
+        payload["event"]["sender"]["sender_id"]["open_id"] = Value::Null;
 
-        let err = parse_text_message(value.to_string().as_bytes()).unwrap_err();
-
-        assert!(matches!(err, LarkEventError::UnsupportedMessageType(_)));
+        let err = parse_text_message(payload.to_string().as_bytes()).unwrap_err();
+        assert!(matches!(
+            err,
+            LarkEventError::MissingField("event.sender.sender_id.open_id")
+        ));
     }
 
-    #[tokio::test]
-    async fn bridge_forwards_user_message_without_losing_chat_id() {
-        let (tx, mut rx) = mpsc::channel(1);
-        let bridge = LarkEventBridge::new(tx);
-        let payload = fixture("oc_target", "ou_sender", "om_1", "reply here", "333");
+    // ============ V6.5: p2p and group both carry chat_id ============
 
-        bridge
-            .handle_event_payload(payload.to_string().as_bytes())
-            .await
-            .unwrap();
-        let message = rx.recv().await.unwrap();
+    #[test]
+    fn v6_5_p2p_chat_with_chat_id_parses_correctly() {
+        // p2p chats also carry chat_id (oc_ prefix); ADR-0005 treats them
+        // uniformly — no chat_type branching in Stage 1.
+        let payload = fixture("oc_p2p_chat", "ou_user", "om_p2p", "private hello", "222");
+        let msg = parse_text_message(payload.to_string().as_bytes()).unwrap();
+        assert_eq!(msg.chat_id, ChatId("oc_p2p_chat".to_owned()));
+        assert_eq!(msg.text, "private hello");
+    }
 
-        assert_eq!(message.chat_id, ChatId("oc_target".to_string()));
-        assert_eq!(message.sender, UserId("ou_sender".to_string()));
-        assert_eq!(message.msg_id, "om_1");
-        assert_eq!(message.text, "reply here");
+    // ============ Extra: unsupported event type ============
+
+    #[test]
+    fn unsupported_event_type_rejected() {
+        let mut payload = fixture("oc_a", "ou_sender", "om_1", "hello", "111");
+        payload["header"]["event_type"] = json!("some.other.event");
+
+        let err = parse_text_message(payload.to_string().as_bytes()).unwrap_err();
+        assert!(matches!(err, LarkEventError::UnsupportedEventType(_)));
+    }
+
+    // ============ Extra: invalid JSON ============
+
+    #[test]
+    fn invalid_json_rejected_with_invalid_event_payload() {
+        let err = parse_text_message(b"not json").unwrap_err();
+        assert!(matches!(err, LarkEventError::InvalidEventPayload(_)));
+    }
+
+    // ============ Extra: empty chat_id string is treated as missing ============
+
+    #[test]
+    fn empty_chat_id_string_treated_as_missing() {
+        let mut payload = fixture("oc_a", "ou_sender", "om_1", "hello", "111");
+        payload["event"]["message"]["chat_id"] = json!("");
+
+        let err = parse_text_message(payload.to_string().as_bytes()).unwrap_err();
+        assert!(matches!(
+            err,
+            LarkEventError::MissingField("event.message.chat_id")
+        ));
     }
 
     fn fixture(

@@ -1,10 +1,9 @@
-//! Feishu/Lark adapter boundary.
+//! deapbox-lark — Feishu WS inbound + OpenAPI outbound adapter.
 
 pub mod api;
-pub mod card;
 pub mod event;
-pub mod types;
+pub mod ws;
 
-pub use api::{LarkApiError, LarkMessageApi, OpenLarkMessageApi};
-pub use event::{LarkEventBridge, LarkEventError};
-pub use types::{InboundTextMessage, OutboundTextMessage};
+pub use api::OpenLarkMessageApi;
+pub use event::{parse_text_message, LarkEventError};
+pub use ws::start_ws;

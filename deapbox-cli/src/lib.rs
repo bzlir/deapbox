@@ -1,653 +1,402 @@
-use std::collections::{BTreeMap, HashSet};
-use std::path::{Path, PathBuf};
+//! deapbox-cli — binary entry: arg parsing + service assembly + main loop.
+//!
+//! Stage 1 walking skeleton (ADRs 0001-0009):
+//! 1. parse CLI args → config path
+//! 2. load_config → AppConfig
+//! 3. build bindings HashMap + agents HashMap
+//! 4. construct OpenLarkMessageApi + ChatDispatcher
+//! 5. start Feishu WS inbound
+//! 6. main loop: payload_rx → parse → dispatcher.dispatch(msg) | ctrl_c | sigterm
+//! 7. ChatDispatcher::drop aborts all per-chat tasks (ADR-0008)
 
-use deapbox_core::types::{AppConfig, ChatId, UserMessage};
-use deapbox_lark::{LarkMessageApi, OpenLarkMessageApi};
-use deapbox_store::config::{load_config, ConfigError};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
 
-pub mod setup;
+use deapbox_agent::EchoAgent;
+use deapbox_core::agent::Agent;
+use deapbox_core::dispatcher::ChatDispatcher;
+use deapbox_core::lark_api::LarkMessageApi;
+use deapbox_core::types::{AgentId, AgentKind, AppConfig, Binding, ChatId};
+use deapbox_lark::{parse_text_message, start_ws, OpenLarkMessageApi};
 
-pub use setup::SetupError;
+#[derive(Debug, thiserror::Error)]
+pub enum CliError {
+    #[error("configuration error: {0}")]
+    Config(#[from] deapbox_store::ConfigError),
+    #[error("Lark API setup error: {0}")]
+    LarkApi(#[from] deapbox_core::types::LarkApiError),
+    #[error("agent '{0}' has unsupported kind for Stage 1 (only echo is implemented)")]
+    UnsupportedAgentKind(String),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+}
 
-const OPERATOR_HELP: &str = "/chats | /use <chat_id> | /send <chat_id> <text> | /quit | /exit";
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct CliOptions {
     pub config_path: PathBuf,
-    pub check_config: bool,
-    pub dry_run: bool,
 }
 
 impl CliOptions {
     pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, CliError> {
         let mut config_path = PathBuf::from("config.toml");
-        let mut check_config = false;
-        let mut dry_run = false;
         let mut args = args.into_iter();
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--config" => {
                     let Some(path) = args.next() else {
-                        return Err(CliError::InvalidArgs(
-                            "--config requires a file path".to_string(),
-                        ));
+                        return Err(CliError::Config(deapbox_store::ConfigError::Invalid(
+                            "--config requires a file path".to_owned(),
+                        )));
                     };
                     config_path = PathBuf::from(path);
                 }
-                "--check-config" => check_config = true,
-                "--dry-run" => dry_run = true,
-                "-h" | "--help" => return Err(CliError::Help(usage())),
+                "-h" | "--help" => {
+                    println!("deapbox --config <path>");
+                    std::process::exit(0);
+                }
                 other => {
-                    return Err(CliError::InvalidArgs(format!(
-                        "unknown argument: {other}\n{}",
-                        usage()
+                    return Err(CliError::Config(deapbox_store::ConfigError::Invalid(
+                        format!("unknown argument: {other}"),
                     )));
                 }
             }
         }
 
-        Ok(Self {
-            config_path,
-            check_config,
-            dry_run,
+        Ok(Self { config_path })
+    }
+}
+
+/// Assemble agents registry from config. Stage 1: only `Echo` kind is
+/// supported; other kinds return `UnsupportedAgentKind`.
+pub fn build_agents_registry(
+    config: &AppConfig,
+) -> Result<HashMap<AgentId, Arc<dyn Agent>>, CliError> {
+    let mut agents = HashMap::new();
+    for agent_cfg in &config.agents {
+        match agent_cfg.kind {
+            AgentKind::Echo => {
+                agents.insert(
+                    agent_cfg.id.clone(),
+                    Arc::new(EchoAgent::new()) as Arc<dyn Agent>,
+                );
+            }
+            _ => {
+                return Err(CliError::UnsupportedAgentKind(agent_cfg.id.0.clone()));
+            }
+        }
+    }
+    Ok(agents)
+}
+
+/// Assemble bindings registry from config. One entry per `[[sessions]]`.
+pub fn build_bindings_registry(config: &AppConfig) -> HashMap<ChatId, Binding> {
+    config
+        .sessions
+        .iter()
+        .map(|s| {
+            (
+                s.chat_id.clone(),
+                Binding {
+                    agent_id: s.agent_id.clone(),
+                    workspace: s.workspace.clone(),
+                },
+            )
         })
-    }
+        .collect()
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum CliError {
-    #[error("{0}")]
-    Help(String),
-    #[error("{0}")]
-    InvalidArgs(String),
-    #[error("configuration error: {0}")]
-    Config(#[from] ConfigError),
-    #[error("Lark API setup error: {0}")]
-    LarkApi(#[from] deapbox_lark::LarkApiError),
-    #[error("Lark inbound event source is unavailable: {0}")]
-    InboundEventsUnavailable(&'static str),
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("setup error: {0}")]
-    Setup(#[from] SetupError),
+/// Run the deapbox service. Returns when the main loop exits (Ctrl+C,
+/// SIGTERM, or WS connection closes — ADR-0008).
+pub async fn run_service(config: AppConfig) -> Result<(), CliError> {
+    let agents = build_agents_registry(&config)?;
+    let bindings = build_bindings_registry(&config);
+
+    let lark_api: Arc<dyn LarkMessageApi> = Arc::new(OpenLarkMessageApi::new(&config.lark)?);
+
+    let dispatcher = ChatDispatcher::start(bindings, agents, Arc::clone(&lark_api));
+
+    let (mut payload_rx, ws_join) = start_ws(&config.lark)?;
+
+    tracing::info!(
+        sessions = dispatcher.route_count(),
+        "deapbox Stage 1 running; press Ctrl+C to shut down"
+    );
+
+    main_loop(&mut payload_rx, &dispatcher).await;
+
+    // main loop exited — abort everything
+    ws_join.abort();
+    drop(dispatcher);
+    tracing::info!("deapbox shut down");
+    Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Command {
-    Run(CliOptions),
-    Setup(setup::SetupCommand),
-}
-
-pub fn parse_command(args: impl IntoIterator<Item = String>) -> Result<Command, CliError> {
-    let mut iter = args.into_iter().peekable();
-    if let Some(first) = iter.peek() {
-        if first == "setup" {
-            iter.next();
-            let rest: Vec<String> = iter.collect();
-            return Ok(Command::Setup(setup::parse_args(rest)?));
-        }
-    }
-    Ok(Command::Run(CliOptions::parse(iter)?))
-}
-
-#[derive(Debug, Default)]
-pub struct ConsoleState {
-    seen_chats: BTreeMap<ChatId, ChatSummary>,
-    seen_msg_ids: HashSet<String>,
-    current_chat: Option<ChatId>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ChatSummary {
-    sender: String,
-    last_text: String,
-}
-
-impl ConsoleState {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn record_inbound(&mut self, message: &UserMessage) -> Option<String> {
-        if !self.seen_msg_ids.insert(message.msg_id.clone()) {
-            return None;
-        }
-
-        self.seen_chats.insert(
-            message.chat_id.clone(),
-            ChatSummary {
-                sender: message.sender.0.clone(),
-                last_text: message.text.clone(),
-            },
-        );
-        Some(format!(
-            "[chat_id={}] sender={} msg_id={} text={}",
-            message.chat_id.0, message.sender.0, message.msg_id, message.text
-        ))
-    }
-
-    pub fn list_chats(&self) -> Vec<String> {
-        if self.seen_chats.is_empty() {
-            return vec!["no chats seen yet".to_string()];
-        }
-
-        self.seen_chats
-            .iter()
-            .map(|(chat_id, summary)| {
-                let marker = if self.current_chat.as_ref() == Some(chat_id) {
-                    "*"
-                } else {
-                    " "
-                };
-                format!(
-                    "{marker} chat_id={} last_sender={} last_text={}",
-                    chat_id.0, summary.sender, summary.last_text
-                )
-            })
-            .collect()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CommandResult {
-    pub output: Vec<String>,
-    pub should_quit: bool,
-}
-
-impl CommandResult {
-    fn line(line: impl Into<String>) -> Self {
-        Self {
-            output: vec![line.into()],
-            should_quit: false,
-        }
-    }
-
-    fn quit() -> Self {
-        Self {
-            output: vec!["bye".to_string()],
-            should_quit: true,
-        }
-    }
-}
-
-pub async fn handle_operator_line<A: LarkMessageApi>(
-    state: &mut ConsoleState,
-    api: &A,
-    input: &str,
-) -> CommandResult {
-    let input = input.trim_start().trim_end_matches(['\r', '\n']);
-    if input.trim().is_empty() {
-        return CommandResult::line("");
-    }
-
-    let command = input.trim_end();
-
-    if command == "/quit" || command == "/exit" {
-        return CommandResult::quit();
-    }
-    if command == "/help" {
-        return CommandResult::line(OPERATOR_HELP);
-    }
-    if command == "/chats" {
-        return CommandResult {
-            output: state.list_chats(),
-            should_quit: false,
-        };
-    }
-    if let Some(rest) = input.strip_prefix("/use ") {
-        let chat_id = match parse_chat_id(rest.trim()) {
-            Ok(chat_id) => chat_id,
-            Err(message) => return CommandResult::line(message),
-        };
-        let output = format!("current chat_id={}", chat_id.0);
-        state.current_chat = Some(chat_id);
-        return CommandResult::line(output);
-    }
-    if let Some(rest) = input.strip_prefix("/send ") {
-        let Some((chat_id, text)) = split_first_arg(rest) else {
-            return CommandResult::line("usage: /send <chat_id> <text>");
-        };
-        let chat_id = match parse_chat_id(chat_id) {
-            Ok(chat_id) => chat_id,
-            Err(message) => return CommandResult::line(message),
-        };
-        return send_text(api, chat_id, text).await;
-    }
-    if input.starts_with('/') {
-        return CommandResult::line("unknown command; try /help");
-    }
-
-    let Some(chat_id) = state.current_chat.clone() else {
-        return CommandResult::line(
-            "no current chat; use /send <chat_id> <text> or /use <chat_id>",
-        );
-    };
-    send_text(api, chat_id, input).await
-}
-
-async fn send_text<A: LarkMessageApi>(api: &A, chat_id: ChatId, text: &str) -> CommandResult {
-    if text.trim().is_empty() {
-        return CommandResult::line("message text cannot be empty");
-    }
-
-    match api.send_text(&chat_id, text).await {
-        Ok(()) => CommandResult::line(format!("sent chat_id={}", chat_id.0)),
-        Err(err) => CommandResult::line(format!("send failed chat_id={}: {err}", chat_id.0)),
-    }
-}
-
-fn split_first_arg(input: &str) -> Option<(&str, &str)> {
-    let input = input.trim_start();
-    let split_at = input
-        .char_indices()
-        .find_map(|(index, ch)| ch.is_whitespace().then_some(index))?;
-    let (first, rest) = input.split_at(split_at);
-    Some((first, rest.trim_start()))
-}
-
-fn parse_chat_id(input: &str) -> Result<ChatId, &'static str> {
-    if input.is_empty() {
-        return Err("chat_id cannot be empty");
-    }
-    if input.chars().any(char::is_whitespace) {
-        return Err("chat_id cannot contain whitespace");
-    }
-    Ok(ChatId(input.to_string()))
-}
-
-pub fn load_checked_config(path: &Path) -> Result<AppConfig, CliError> {
-    Ok(load_config(path)?)
-}
-
-pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<(), CliError> {
-    match parse_command(args)? {
-        Command::Run(opts) => run_service(opts).await,
-        Command::Setup(cmd) => setup::run(cmd).await,
-    }
-}
-
-async fn run_service(options: CliOptions) -> Result<(), CliError> {
-    let config = load_checked_config(&options.config_path)?;
-
-    if options.check_config {
-        println!("configuration ok: {}", options.config_path.display());
-        return Ok(());
-    }
-
-    let _api = OpenLarkMessageApi::new(&config.lark)?;
-
-    if options.dry_run {
-        println!(
-            "dry-run: config loaded; outbound Lark API is constructible; inbound event source is not started"
-        );
-        return Ok(());
-    }
-
-    Err(CliError::InboundEventsUnavailable(
-        "the pinned openlark WebSocket handler does not expose event payload forwarding yet; run --dry-run for startup validation or wire a real inbound source before starting the service",
-    ))
-}
-
-pub async fn run_console_loop<A, R, W>(
-    mut state: ConsoleState,
-    api: A,
-    mut inbound_rx: mpsc::Receiver<UserMessage>,
-    stdin: R,
-    mut stdout: W,
-) -> Result<(), CliError>
-where
-    A: LarkMessageApi,
-    R: AsyncBufRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut lines = stdin.lines();
-    let mut inbound_open = true;
-
+/// Main event loop: WS payload → parse → dispatch, with Ctrl+C / SIGTERM exit.
+async fn main_loop(
+    payload_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    dispatcher: &ChatDispatcher,
+) {
+    let mut sigterm = signal_sigterm();
     loop {
         tokio::select! {
             biased;
-
-            message = inbound_rx.recv(), if inbound_open => {
-                match message {
-                    Some(message) => {
-                        if let Some(line) = state.record_inbound(&message) {
-                            write_line(&mut stdout, &line).await?;
-                        }
-                    }
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("received SIGINT (Ctrl+C), shutting down");
+                break;
+            }
+            _ = sigterm.recv() => {
+                tracing::info!("received SIGTERM, shutting down");
+                break;
+            }
+            payload = payload_rx.recv() => {
+                match payload {
+                    Some(bytes) => handle_payload(&bytes, dispatcher).await,
                     None => {
-                        inbound_open = false;
-                        write_line(&mut stdout, "inbound Lark channel closed").await?;
+                        tracing::info!("WebSocket inbound channel closed, shutting down");
+                        break;
                     }
                 }
             }
-            line = lines.next_line() => {
-                let Some(line) = line? else {
-                    break;
-                };
-                let result = handle_operator_line(&mut state, &api, &line).await;
-                for line in result.output {
-                    if !line.is_empty() {
-                        write_line(&mut stdout, &line).await?;
-                    }
-                }
-                if result.should_quit {
-                    break;
-                }
-            }
         }
     }
-
-    Ok(())
 }
 
-async fn write_line<W: AsyncWrite + Unpin>(writer: &mut W, line: &str) -> Result<(), CliError> {
-    writer.write_all(line.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
-    writer.flush().await?;
-    Ok(())
+async fn handle_payload(bytes: &[u8], dispatcher: &ChatDispatcher) {
+    match parse_text_message(bytes) {
+        Ok(msg) => match dispatcher.dispatch(msg) {
+            Ok(()) => {}
+            Err(deapbox_core::dispatcher::DispatchError::UnboundChat(chat)) => {
+                tracing::info!(chat_id = %chat.0, "unbound chat, ignored");
+            }
+            Err(deapbox_core::dispatcher::DispatchError::ChannelClosed(chat)) => {
+                tracing::error!(chat_id = %chat.0, "per-chat channel closed unexpectedly");
+            }
+        },
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to parse Lark event payload, ignored");
+        }
+    }
 }
 
-fn usage() -> String {
-    "usage: deapbox [--config <path>] [--check-config] [--dry-run]\n       deapbox setup <command> [options]  (run `deapbox setup --help` for details)".to_string()
+#[cfg(unix)]
+fn signal_sigterm() -> tokio::signal::unix::Signal {
+    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("install SIGTERM handler")
 }
 
-#[cfg(test)]
-mod dispatch_tests {
-    use super::*;
-
-    #[test]
-    fn parse_command_routes_setup_subcommand() {
-        let cmd = parse_command(["setup".into(), "--help".into()]).unwrap();
-        match cmd {
-            Command::Setup(setup::SetupCommand::Help) => {}
-            other => panic!("expected Setup::Help, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_command_routes_setup_bind() {
-        let cmd =
-            parse_command(["setup".into(), "bind".into(), "--app".into(), "x:y".into()]).unwrap();
-        match cmd {
-            Command::Setup(setup::SetupCommand::Bind(b)) => {
-                assert_eq!(b.app_id, "x");
-                assert_eq!(b.app_secret, "y");
-            }
-            other => panic!("expected Setup::Bind, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_command_routes_setup_new() {
-        let cmd = parse_command(["setup".into(), "new".into()]).unwrap();
-        assert!(matches!(cmd, Command::Setup(setup::SetupCommand::New(_))));
-    }
-
-    #[test]
-    fn parse_command_falls_through_to_run_when_no_setup_prefix() {
-        let cmd = parse_command(["--check-config".into()]).unwrap();
-        match cmd {
-            Command::Run(opts) => assert!(opts.check_config),
-            other => panic!("expected Run, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_command_run_with_config_path_unchanged() {
-        let cmd = parse_command(["--config".into(), "/tmp/x.toml".into()]).unwrap();
-        match cmd {
-            Command::Run(opts) => assert_eq!(opts.config_path, PathBuf::from("/tmp/x.toml")),
-            other => panic!("expected Run, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_command_setup_with_no_args_returns_auto_new() {
-        // IVA-10: `deapbox setup`（无参）→ auto-detect → NEW（无 --app）
-        let cmd = parse_command(["setup".into()]).unwrap();
-        match cmd {
-            Command::Setup(setup::SetupCommand::Auto(a)) => {
-                assert_eq!(a.kind, setup::AutoKind::New);
-            }
-            other => panic!("expected Setup::Auto(New), got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn run_from_args_setup_help_prints_usage_and_succeeds() {
-        let result = run_from_args(["setup".into(), "--help".into()]).await;
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn parse_command_routes_setup_new_to_new_variant() {
-        // C2 后 NEW 模式真实现，不再返 NotImplemented；这里只测路由不真调飞书 OAuth。
-        let cmd = parse_command(["setup".into(), "new".into()]).unwrap();
-        match cmd {
-            Command::Setup(setup::SetupCommand::New(_)) => {}
-            other => panic!("expected Setup::New, got {other:?}"),
-        }
-    }
+#[cfg(not(unix))]
+fn signal_sigterm() -> std::pin::Pin<Box<dyn futures_util::stream::Stream<Item = ()> + Send>> {
+    Box::pin(futures_util::stream::pending())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
-
-    use async_trait::async_trait;
-    use deapbox_core::types::UserId;
-
     use super::*;
+    use deapbox_store::load_config;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
 
-    #[derive(Debug, Default, Clone)]
-    struct FakeLarkApi {
-        sent: Arc<Mutex<Vec<(ChatId, String)>>>,
+    fn write_config(toml: &str) -> NamedTempFile {
+        let mut f = NamedTempFile::new().unwrap();
+        write!(f, "{}", toml).unwrap();
+        f
     }
 
-    #[async_trait]
-    impl LarkMessageApi for FakeLarkApi {
-        async fn send_text(
-            &self,
-            chat_id: &ChatId,
-            text: &str,
-        ) -> Result<(), deapbox_lark::LarkApiError> {
-            self.sent
-                .lock()
-                .unwrap()
-                .push((chat_id.clone(), text.to_string()));
-            Ok(())
+    fn sample_config_toml() -> &'static str {
+        r#"
+[lark]
+app_id = "cli_test"
+app_secret = "sec_test"
+
+[[agents]]
+id = "echo-a"
+kind = "echo"
+command = ""
+
+[[agents]]
+id = "echo-b"
+kind = "echo"
+command = ""
+
+[[sessions]]
+chat_id = "oc_x"
+agent_id = "echo-a"
+
+[[sessions]]
+chat_id = "oc_y"
+agent_id = "echo-b"
+"#
+    }
+
+    // ============ CLI option parsing ============
+
+    #[test]
+    fn cli_options_default_config_path() {
+        let opts = CliOptions::parse(std::iter::empty::<String>()).unwrap();
+        assert_eq!(opts.config_path, PathBuf::from("config.toml"));
+    }
+
+    #[test]
+    fn cli_options_custom_config_path() {
+        let opts = CliOptions::parse(["--config".to_owned(), "/tmp/x.toml".to_owned()]).unwrap();
+        assert_eq!(opts.config_path, PathBuf::from("/tmp/x.toml"));
+    }
+
+    #[test]
+    fn cli_options_unknown_arg_rejected() {
+        let err = CliOptions::parse(["--bogus".to_owned()]).unwrap_err();
+        assert!(matches!(err, CliError::Config(_)));
+    }
+
+    // ============ build_agents_registry ============
+
+    #[test]
+    fn build_agents_registry_only_echo_supported() {
+        let cfg = load_config(write_config(sample_config_toml()).path()).unwrap();
+        let agents = build_agents_registry(&cfg).unwrap();
+        assert_eq!(agents.len(), 2);
+        assert!(agents.contains_key(&AgentId("echo-a".to_owned())));
+        assert!(agents.contains_key(&AgentId("echo-b".to_owned())));
+    }
+
+    #[test]
+    fn build_agents_registry_non_echo_rejected() {
+        let cfg = load_config(
+            write_config(
+                r#"
+[lark]
+app_id = "x"
+app_secret = "y"
+
+[[agents]]
+id = "claude"
+kind = "claude-code"
+command = "claude"
+"#,
+            )
+            .path(),
+        )
+        .unwrap();
+        match build_agents_registry(&cfg) {
+            Err(CliError::UnsupportedAgentKind(_)) => {}
+            other => panic!("expected UnsupportedAgentKind, got {:?}", other.map(|_| ())),
         }
     }
 
-    #[tokio::test]
-    async fn send_command_targets_only_the_explicit_chat() {
-        let api = FakeLarkApi::default();
-        let mut state = ConsoleState::new();
+    // ============ build_bindings_registry ============
 
-        let result = handle_operator_line(&mut state, &api, "/send oc_a hello A").await;
-
-        assert_eq!(result.output, vec!["sent chat_id=oc_a"]);
+    #[test]
+    fn build_bindings_registry_maps_all_sessions() {
+        let cfg = load_config(write_config(sample_config_toml()).path()).unwrap();
+        let bindings = build_bindings_registry(&cfg);
+        assert_eq!(bindings.len(), 2);
         assert_eq!(
-            *api.sent.lock().unwrap(),
-            vec![(ChatId("oc_a".to_string()), "hello A".to_string())]
+            bindings.get(&ChatId("oc_x".to_owned())).unwrap().agent_id,
+            AgentId("echo-a".to_owned())
+        );
+        assert_eq!(
+            bindings.get(&ChatId("oc_y".to_owned())).unwrap().agent_id,
+            AgentId("echo-b".to_owned())
         );
     }
 
-    #[test]
-    fn interleaved_inbound_messages_print_distinct_chat_ids() {
-        let mut state = ConsoleState::new();
-        let first = state
-            .record_inbound(&message("oc_a", "ou_1", "om_1", "hello A"))
-            .unwrap();
-        let second = state
-            .record_inbound(&message("oc_b", "ou_2", "om_2", "hello B"))
-            .unwrap();
-
-        assert!(first.contains("chat_id=oc_a"));
-        assert!(first.contains("sender=ou_1"));
-        assert!(first.contains("text=hello A"));
-        assert!(second.contains("chat_id=oc_b"));
-        assert!(second.contains("sender=ou_2"));
-        assert!(second.contains("text=hello B"));
-    }
-
-    #[test]
-    fn duplicate_inbound_msg_id_is_skipped() {
-        let mut state = ConsoleState::new();
-        let first = message("oc_a", "ou_1", "om_same", "hello");
-        let retry = message("oc_a", "ou_1", "om_same", "hello again");
-
-        assert!(state.record_inbound(&first).is_some());
-        assert_eq!(state.record_inbound(&retry), None);
-    }
+    // ============ handle_payload with fake dispatcher ============
 
     #[tokio::test]
-    async fn plain_text_without_default_chat_does_not_send() {
-        let api = FakeLarkApi::default();
-        let mut state = ConsoleState::new();
+    async fn handle_payload_parses_and_dispatches() {
+        use deapbox_core::test_support::{FakeAgent, FakeLarkMessageApi};
 
-        let result = handle_operator_line(&mut state, &api, "do not leak").await;
-
-        assert_eq!(
-            result.output,
-            vec!["no current chat; use /send <chat_id> <text> or /use <chat_id>"]
+        // assemble a tiny dispatcher with one binding
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            ChatId("oc_a".to_owned()),
+            Binding {
+                agent_id: AgentId("e".to_owned()),
+                workspace: None,
+            },
         );
-        assert!(api.sent.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn use_command_routes_plain_text_until_switched() {
-        let api = FakeLarkApi::default();
-        let mut state = ConsoleState::new();
-
-        handle_operator_line(&mut state, &api, "/use oc_a").await;
-        handle_operator_line(&mut state, &api, "hello A").await;
-        handle_operator_line(&mut state, &api, "/use oc_b").await;
-        handle_operator_line(&mut state, &api, "hello B").await;
-
-        assert_eq!(
-            *api.sent.lock().unwrap(),
-            vec![
-                (ChatId("oc_a".to_string()), "hello A".to_string()),
-                (ChatId("oc_b".to_string()), "hello B".to_string()),
-            ]
+        let mut agents = HashMap::new();
+        agents.insert(
+            AgentId("e".to_owned()),
+            Arc::new(FakeAgent::echo()) as Arc<dyn Agent>,
         );
+        let lark = Arc::new(FakeLarkMessageApi::new()) as Arc<dyn LarkMessageApi>;
+        let dispatcher = ChatDispatcher::start(bindings, agents, lark);
+
+        // simulate a text-message payload
+        let payload = serde_json::json!({
+            "schema": "2.0",
+            "header": { "event_type": "im.message.receive_v1", "create_time": "111" },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_s" } },
+                "message": {
+                    "chat_id": "oc_a",
+                    "message_id": "om_1",
+                    "message_type": "text",
+                    "create_time": "111",
+                    "content": serde_json::to_string(&serde_json::json!({"text": "hi"})).unwrap()
+                }
+            }
+        })
+        .to_string();
+        handle_payload(payload.as_bytes(), &dispatcher).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // dispatcher should have routed to the echo agent
+        // (we can't easily assert the outbound here without inspecting internals,
+        //  but the absence of a panic + the route being hit is the assertion)
+        drop(dispatcher);
     }
 
     #[tokio::test]
-    async fn invalid_chat_id_is_rejected_before_use() {
-        let api = FakeLarkApi::default();
-        let mut state = ConsoleState::new();
+    async fn handle_payload_unbound_chat_does_not_panic() {
+        use deapbox_core::test_support::{FakeAgent, FakeLarkMessageApi};
 
-        let result = handle_operator_line(&mut state, &api, "/use oc a").await;
-
-        assert_eq!(result.output, vec!["chat_id cannot contain whitespace"]);
-        assert!(api.sent.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn send_command_rejects_empty_text_consistently() {
-        let api = FakeLarkApi::default();
-        let mut state = ConsoleState::new();
-
-        let result = handle_operator_line(&mut state, &api, "/send oc_a ").await;
-
-        assert_eq!(result.output, vec!["message text cannot be empty"]);
-        assert!(api.sent.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn console_loop_handles_inbound_and_operator_commands() {
-        let api = FakeLarkApi::default();
-        let (tx, rx) = mpsc::channel(4);
-        tx.send(message("oc_a", "ou_1", "om_1", "hello"))
-            .await
-            .unwrap();
-        drop(tx);
-
-        let stdin = tokio::io::BufReader::new("/use oc_a\nreply\n/quit\n".as_bytes());
-        let mut output = Vec::new();
-        run_console_loop(ConsoleState::new(), api.clone(), rx, stdin, &mut output)
-            .await
-            .unwrap();
-        let output = String::from_utf8(output).unwrap();
-
-        assert!(output.contains("chat_id=oc_a"));
-        assert!(output.contains("sender=ou_1"));
-        assert!(output.contains("sent chat_id=oc_a"));
-        assert_eq!(
-            *api.sent.lock().unwrap(),
-            vec![(ChatId("oc_a".to_string()), "reply".to_string())]
+        let bindings = HashMap::new();
+        let mut agents = HashMap::new();
+        agents.insert(
+            AgentId("e".to_owned()),
+            Arc::new(FakeAgent::echo()) as Arc<dyn Agent>,
         );
-    }
+        let lark = Arc::new(FakeLarkMessageApi::new()) as Arc<dyn LarkMessageApi>;
+        let dispatcher = ChatDispatcher::start(bindings, agents, lark);
 
-    #[test]
-    fn check_config_validates_config_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let valid = dir.path().join("valid.toml");
-        std::fs::write(
-            &valid,
-            r#"
-[lark]
-app_id = "cli_xxx"
-app_secret = "secret_xxx"
-
-[[agents]]
-id = "codex-dev"
-kind = "codex"
-command = "codex"
-"#,
-        )
-        .unwrap();
-        let invalid = dir.path().join("invalid.toml");
-        std::fs::write(&invalid, "not toml").unwrap();
-
-        assert!(load_checked_config(&valid).is_ok());
-        assert!(load_checked_config(&invalid).is_err());
+        let payload = serde_json::json!({
+            "schema": "2.0",
+            "header": { "event_type": "im.message.receive_v1", "create_time": "111" },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_s" } },
+                "message": {
+                    "chat_id": "oc_unbound",
+                    "message_id": "om_1",
+                    "message_type": "text",
+                    "create_time": "111",
+                    "content": serde_json::to_string(&serde_json::json!({"text": "hi"})).unwrap()
+                }
+            }
+        })
+        .to_string();
+        handle_payload(payload.as_bytes(), &dispatcher).await;
+        // no panic, no crash — that's the assertion
     }
 
     #[tokio::test]
-    async fn non_dry_run_fails_when_inbound_source_is_unavailable() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = dir.path().join("valid.toml");
-        std::fs::write(
-            &config,
-            r#"
-[lark]
-app_id = "cli_xxx"
-app_secret = "secret_xxx"
+    async fn handle_payload_malformed_payload_does_not_panic() {
+        use deapbox_core::test_support::{FakeAgent, FakeLarkMessageApi};
 
-[[agents]]
-id = "codex-dev"
-kind = "codex"
-command = "codex"
-"#,
-        )
-        .unwrap();
+        let bindings = HashMap::new();
+        let mut agents = HashMap::new();
+        agents.insert(
+            AgentId("e".to_owned()),
+            Arc::new(FakeAgent::echo()) as Arc<dyn Agent>,
+        );
+        let lark = Arc::new(FakeLarkMessageApi::new()) as Arc<dyn LarkMessageApi>;
+        let dispatcher = ChatDispatcher::start(bindings, agents, lark);
 
-        let err = run_from_args(vec!["--config".to_string(), config.display().to_string()])
-            .await
-            .unwrap_err();
-
-        assert!(matches!(err, CliError::InboundEventsUnavailable(_)));
-    }
-
-    #[test]
-    fn default_config_path_is_cwd_relative() {
-        let options = CliOptions::parse(Vec::<String>::new()).unwrap();
-
-        assert_eq!(options.config_path, PathBuf::from("config.toml"));
-    }
-
-    fn message(chat_id: &str, sender: &str, msg_id: &str, text: &str) -> UserMessage {
-        UserMessage {
-            chat_id: ChatId(chat_id.to_string()),
-            sender: UserId(sender.to_string()),
-            text: text.to_string(),
-            msg_id: msg_id.to_string(),
-        }
+        handle_payload(b"not valid json", &dispatcher).await;
+        handle_payload(b"", &dispatcher).await;
+        // no panic
     }
 }

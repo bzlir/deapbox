@@ -9,4 +9,4 @@ members = [
 ]
 
 [workspace.dependencies]
-openlark = { version = "0.20.0", default-features = false, features = ["auth", "communication"] }
+openlark = { version = "0.20.0", default-features = false, features = ["auth", "communication", "websocket"] }
