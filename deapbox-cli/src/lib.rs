@@ -9,6 +9,8 @@
 //! 6. main loop: payload_rx → parse → dispatcher.dispatch(msg) | ctrl_c | sigterm
 //! 7. ChatDispatcher::drop aborts all per-chat tasks (ADR-0008)
 
+pub mod setup;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;

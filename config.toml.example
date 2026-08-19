@@ -1,34 +1,35 @@
-# deapbox 配置文件示例
+# deapbox Stage 1 config example
 #
-# 推荐初始化方式：
-#   deapbox setup            # 无凭证 → 扫码自动创建飞书应用（NEW 模式）
-#   deapbox setup bind --app cli_xxx:sec_xxx   # 已有凭证 → 校验后写回（BIND 模式）
-#
-# 手动初始化（参考本文件）：
-#   cp config.toml.example config.toml  再填值
-#
-# config.toml 已在 .gitignore 中，不入库（含 Lark app_secret 等敏感信息）。
+# 复制为 config.toml 后填值：cp config.toml.example config.toml
+# config.toml 已在 .gitignore 中（含 app_secret 敏感信息，不入库）
 
 [lark]
 # 飞书自建应用凭证：https://open.feishu.cn/app
+# 应用需启用机器人能力，并订阅事件 im.message.receive_v1
 app_id = "cli_xxxxxxxxxxxxxxxx"
 app_secret = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
-# Agent 定义列表。kind 可选：opencode / codex / claude-code / kimi-code
+# Agent 定义列表。Stage 1 只支持 kind = "echo"（测试 stub，原样回显）。
+# Stage 2 落地真 agent 后支持：claude-code / kimi-code / opencode / codex
 [[agents]]
-id = "claude-main"
-kind = "claude-code"
-command = "claude"
-# args = ["--model", "sonnet"]
-# env_vars = { ANTHROPIC_API_KEY = "sk-..." }
+id = "echo-a"
+kind = "echo"
+command = ""
 
-[[agents]]
-id = "kimi-main"
-kind = "kimi-code"
-command = "kimi"
+# 可配多个 echo agent 验证多群路由
+# [[agents]]
+# id = "echo-b"
+# kind = "echo"
+# command = ""
 
-# 首启 session 绑定（可选；运行后由 /switch 等命令动态修改，存于 sled）
-# [[sessions]]
-# chat_id = "oc_xxxxxxxxxxxxxxxx"
-# agent_id = "claude-main"
+# Session 绑定（chat_id → agent_id）。
+# 启动时一次性读入内存，运行期不可变（ADR-0004）。
+# workspace 选填（Stage 1 echo 不用；Stage 2 真 agent 必填——ADR-0007）
+[[sessions]]
+chat_id = "oc_xxxxxxxxxxxxxxxx"
+agent_id = "echo-a"
 # workspace = "/Users/me/lab/my-project"
+
+# 第一次配置时不知道 chat_id：先不写 [[sessions]]，启动 deapbox，
+# 在群里发消息，终端日志会打印 "unbound chat oc_xxx, ignored"，
+# 抄下 chat_id 填进 config，重启 deapbox 即可。
