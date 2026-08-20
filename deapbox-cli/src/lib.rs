@@ -15,11 +15,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use deapbox_agent::EchoAgent;
+use deapbox_agent::{EchoAgent, OpenCodeAgent};
 use deapbox_core::agent::Agent;
 use deapbox_core::dispatcher::ChatDispatcher;
 use deapbox_core::lark_api::LarkMessageApi;
-use deapbox_core::types::{AgentId, AgentKind, AppConfig, Binding, ChatId};
+use deapbox_core::types::{AgentConfig, AgentId, AgentKind, AppConfig, Binding, ChatId};
 use deapbox_lark::{parse_text_message, start_ws, OpenLarkMessageApi};
 
 #[derive(Debug, thiserror::Error)]
@@ -28,8 +28,10 @@ pub enum CliError {
     Config(#[from] deapbox_store::ConfigError),
     #[error("Lark API setup error: {0}")]
     LarkApi(#[from] deapbox_core::types::LarkApiError),
-    #[error("agent '{0}' has unsupported kind for Stage 1 (only echo is implemented)")]
+    #[error("agent '{0}' has unsupported kind (Stage 2 supports: echo, opencode)")]
     UnsupportedAgentKind(String),
+    #[error("agent '{0}' (kind={1:?}) requires workspace in its [[sessions]] binding")]
+    MissingWorkspace(String, AgentKind),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -70,54 +72,68 @@ impl CliOptions {
     }
 }
 
-/// Assemble agents registry from config. Stage 1: only `Echo` kind is
-/// supported; other kinds return `UnsupportedAgentKind`.
-pub fn build_agents_registry(
-    config: &AppConfig,
-) -> Result<HashMap<AgentId, Arc<dyn Agent>>, CliError> {
-    let mut agents = HashMap::new();
-    for agent_cfg in &config.agents {
-        match agent_cfg.kind {
-            AgentKind::Echo => {
-                agents.insert(
-                    agent_cfg.id.clone(),
-                    Arc::new(EchoAgent::new()) as Arc<dyn Agent>,
-                );
-            }
-            _ => {
-                return Err(CliError::UnsupportedAgentKind(agent_cfg.id.0.clone()));
-            }
+/// Build a per-chat agent instance from the binding + agent config.
+///
+/// Stateless agents (echo) can share across chats (returned as Arc clone of
+/// a single instance). Stateful agents (opencode) get dedicated instances
+/// with the binding's workspace.
+fn build_chat_agent(
+    agent_cfg: &AgentConfig,
+    binding: &Binding,
+) -> Result<Arc<dyn Agent>, CliError> {
+    match agent_cfg.kind {
+        AgentKind::Echo => Ok(Arc::new(EchoAgent::new()) as Arc<dyn Agent>),
+        AgentKind::Opencode => {
+            let workspace = binding.workspace.clone().ok_or_else(|| {
+                CliError::MissingWorkspace(agent_cfg.id.0.clone(), agent_cfg.kind.clone())
+            })?;
+            let agent = OpenCodeAgent::new(&agent_cfg.command, workspace.0);
+            Ok(Arc::new(agent) as Arc<dyn Agent>)
         }
+        _ => Err(CliError::UnsupportedAgentKind(agent_cfg.id.0.clone())),
     }
-    Ok(agents)
 }
 
-/// Assemble bindings registry from config. One entry per `[[sessions]]`.
-pub fn build_bindings_registry(config: &AppConfig) -> HashMap<ChatId, Binding> {
-    config
-        .sessions
-        .iter()
-        .map(|s| {
-            (
-                s.chat_id.clone(),
-                Binding {
-                    agent_id: s.agent_id.clone(),
-                    workspace: s.workspace.clone(),
-                },
-            )
-        })
-        .collect()
+/// Assemble per-chat agents registry from config.
+///
+/// Each `[[sessions]]` binding gets its own agent instance built via
+/// `build_chat_agent`. Echo agents are stateless and could be shared, but
+/// for simplicity we instantiate per-chat (cheap). Opencode agents are
+/// per-chat by design (each carries its own workspace + session_id chain).
+pub fn build_chat_agents_registry(
+    config: &AppConfig,
+) -> Result<HashMap<ChatId, Arc<dyn Agent>>, CliError> {
+    // Index agent configs by id for lookup
+    let agent_cfgs: HashMap<AgentId, &AgentConfig> =
+        config.agents.iter().map(|a| (a.id.clone(), a)).collect();
+
+    let mut chat_agents: HashMap<ChatId, Arc<dyn Agent>> = HashMap::new();
+    for session in &config.sessions {
+        let agent_cfg = agent_cfgs.get(&session.agent_id).ok_or_else(|| {
+            CliError::Config(deapbox_store::ConfigError::Invalid(format!(
+                "[[sessions]] chat_id={} references unknown agent_id={}",
+                session.chat_id.0, session.agent_id.0
+            )))
+        })?;
+
+        let binding = Binding {
+            agent_id: session.agent_id.clone(),
+            workspace: session.workspace.clone(),
+        };
+        let agent = build_chat_agent(agent_cfg, &binding)?;
+        chat_agents.insert(session.chat_id.clone(), agent);
+    }
+    Ok(chat_agents)
 }
 
 /// Run the deapbox service. Returns when the main loop exits (Ctrl+C,
 /// SIGTERM, or WS connection closes — ADR-0008).
 pub async fn run_service(config: AppConfig) -> Result<(), CliError> {
-    let agents = build_agents_registry(&config)?;
-    let bindings = build_bindings_registry(&config);
+    let chat_agents = build_chat_agents_registry(&config)?;
 
     let lark_api: Arc<dyn LarkMessageApi> = Arc::new(OpenLarkMessageApi::new(&config.lark)?);
 
-    let dispatcher = ChatDispatcher::start(bindings, agents, Arc::clone(&lark_api));
+    let dispatcher = ChatDispatcher::start(chat_agents, Arc::clone(&lark_api));
 
     let (mut payload_rx, ws_join) = start_ws(&config.lark)?;
 
@@ -252,19 +268,19 @@ agent_id = "echo-b"
         assert!(matches!(err, CliError::Config(_)));
     }
 
-    // ============ build_agents_registry ============
+    // ============ build_chat_agents_registry ============
 
     #[test]
-    fn build_agents_registry_only_echo_supported() {
+    fn build_chat_agents_registry_echo_supported() {
         let cfg = load_config(write_config(sample_config_toml()).path()).unwrap();
-        let agents = build_agents_registry(&cfg).unwrap();
-        assert_eq!(agents.len(), 2);
-        assert!(agents.contains_key(&AgentId("echo-a".to_owned())));
-        assert!(agents.contains_key(&AgentId("echo-b".to_owned())));
+        let chat_agents = build_chat_agents_registry(&cfg).unwrap();
+        assert_eq!(chat_agents.len(), 2);
+        assert!(chat_agents.contains_key(&ChatId("oc_x".to_owned())));
+        assert!(chat_agents.contains_key(&ChatId("oc_y".to_owned())));
     }
 
     #[test]
-    fn build_agents_registry_non_echo_rejected() {
+    fn build_chat_agents_registry_unsupported_kind_rejected() {
         let cfg = load_config(
             write_config(
                 r#"
@@ -276,56 +292,104 @@ app_secret = "y"
 id = "claude"
 kind = "claude-code"
 command = "claude"
+
+[[sessions]]
+chat_id = "oc_x"
+agent_id = "claude"
 "#,
             )
             .path(),
         )
         .unwrap();
-        match build_agents_registry(&cfg) {
+        match build_chat_agents_registry(&cfg) {
             Err(CliError::UnsupportedAgentKind(_)) => {}
             other => panic!("expected UnsupportedAgentKind, got {:?}", other.map(|_| ())),
         }
     }
 
-    // ============ build_bindings_registry ============
+    #[test]
+    fn build_chat_agents_registry_opencode_missing_workspace_rejected() {
+        let cfg = load_config(
+            write_config(
+                r#"
+[lark]
+app_id = "x"
+app_secret = "y"
+
+[[agents]]
+id = "oc-agent"
+kind = "opencode"
+command = "opencode"
+
+[[sessions]]
+chat_id = "oc_x"
+agent_id = "oc-agent"
+# workspace missing — should fail
+"#,
+            )
+            .path(),
+        )
+        .unwrap();
+        match build_chat_agents_registry(&cfg) {
+            Err(CliError::MissingWorkspace(id, kind)) => {
+                assert_eq!(id, "oc-agent");
+                assert_eq!(kind, AgentKind::Opencode);
+            }
+            other => panic!("expected MissingWorkspace, got {:?}", other.map(|_| ())),
+        }
+    }
 
     #[test]
-    fn build_bindings_registry_maps_all_sessions() {
-        let cfg = load_config(write_config(sample_config_toml()).path()).unwrap();
-        let bindings = build_bindings_registry(&cfg);
-        assert_eq!(bindings.len(), 2);
-        assert_eq!(
-            bindings.get(&ChatId("oc_x".to_owned())).unwrap().agent_id,
-            AgentId("echo-a".to_owned())
-        );
-        assert_eq!(
-            bindings.get(&ChatId("oc_y".to_owned())).unwrap().agent_id,
-            AgentId("echo-b".to_owned())
-        );
+    fn build_chat_agents_registry_opencode_with_workspace_succeeds() {
+        let cfg = load_config(
+            write_config(
+                r#"
+[lark]
+app_id = "x"
+app_secret = "y"
+
+[[agents]]
+id = "oc-agent"
+kind = "opencode"
+command = "opencode"
+
+[[sessions]]
+chat_id = "oc_x"
+agent_id = "oc-agent"
+workspace = "/tmp/some-project"
+"#,
+            )
+            .path(),
+        )
+        .unwrap();
+        let chat_agents = build_chat_agents_registry(&cfg).unwrap();
+        assert_eq!(chat_agents.len(), 1);
+        assert!(chat_agents.contains_key(&ChatId("oc_x".to_owned())));
     }
 
     // ============ handle_payload with fake dispatcher ============
+
+    /// Helper: build a dispatcher with per-chat fake agents directly.
+    fn dispatcher_with_fakes(
+        chat_agents: Vec<(&str, Arc<dyn Agent>)>,
+        lark: Arc<dyn LarkMessageApi>,
+    ) -> ChatDispatcher {
+        let map: HashMap<ChatId, Arc<dyn Agent>> = chat_agents
+            .into_iter()
+            .map(|(chat, agent)| (ChatId(chat.to_owned()), agent))
+            .collect();
+        ChatDispatcher::start(map, lark)
+    }
 
     #[tokio::test]
     async fn handle_payload_parses_and_dispatches() {
         use deapbox_core::test_support::{FakeAgent, FakeLarkMessageApi};
 
-        // assemble a tiny dispatcher with one binding
-        let mut bindings = HashMap::new();
-        bindings.insert(
-            ChatId("oc_a".to_owned()),
-            Binding {
-                agent_id: AgentId("e".to_owned()),
-                workspace: None,
-            },
-        );
-        let mut agents = HashMap::new();
-        agents.insert(
-            AgentId("e".to_owned()),
-            Arc::new(FakeAgent::echo()) as Arc<dyn Agent>,
-        );
         let lark = Arc::new(FakeLarkMessageApi::new()) as Arc<dyn LarkMessageApi>;
-        let dispatcher = ChatDispatcher::start(bindings, agents, lark);
+        let dispatcher = dispatcher_with_fakes(
+            vec![("oc_a", Arc::new(FakeAgent::echo()) as Arc<dyn Agent>)],
+            lark,
+        );
 
         // simulate a text-message payload
         let payload = serde_json::json!({
@@ -346,24 +410,16 @@ command = "claude"
         handle_payload(payload.as_bytes(), &dispatcher).await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        // dispatcher should have routed to the echo agent
-        // (we can't easily assert the outbound here without inspecting internals,
-        //  but the absence of a panic + the route being hit is the assertion)
         drop(dispatcher);
     }
 
     #[tokio::test]
     async fn handle_payload_unbound_chat_does_not_panic() {
-        use deapbox_core::test_support::{FakeAgent, FakeLarkMessageApi};
+        use deapbox_core::test_support::FakeLarkMessageApi;
 
-        let bindings = HashMap::new();
-        let mut agents = HashMap::new();
-        agents.insert(
-            AgentId("e".to_owned()),
-            Arc::new(FakeAgent::echo()) as Arc<dyn Agent>,
-        );
         let lark = Arc::new(FakeLarkMessageApi::new()) as Arc<dyn LarkMessageApi>;
-        let dispatcher = ChatDispatcher::start(bindings, agents, lark);
+        // empty chat_agents — no bindings
+        let dispatcher = dispatcher_with_fakes(vec![], lark);
 
         let payload = serde_json::json!({
             "schema": "2.0",
@@ -386,16 +442,10 @@ command = "claude"
 
     #[tokio::test]
     async fn handle_payload_malformed_payload_does_not_panic() {
-        use deapbox_core::test_support::{FakeAgent, FakeLarkMessageApi};
+        use deapbox_core::test_support::FakeLarkMessageApi;
 
-        let bindings = HashMap::new();
-        let mut agents = HashMap::new();
-        agents.insert(
-            AgentId("e".to_owned()),
-            Arc::new(FakeAgent::echo()) as Arc<dyn Agent>,
-        );
         let lark = Arc::new(FakeLarkMessageApi::new()) as Arc<dyn LarkMessageApi>;
-        let dispatcher = ChatDispatcher::start(bindings, agents, lark);
+        let dispatcher = dispatcher_with_fakes(vec![], lark);
 
         handle_payload(b"not valid json", &dispatcher).await;
         handle_payload(b"", &dispatcher).await;

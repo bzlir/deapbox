@@ -2,25 +2,28 @@
 
 use async_trait::async_trait;
 
-use crate::types::{AgentEvent, Attachment, ChatId, CoreError};
+use crate::types::{AgentEventStream, Attachment, ChatId, CoreError};
 
 /// A coding-agent CLI driven by deapbox. One impl per `AgentKind`.
 ///
-/// Stage 1: only `EchoAgent`. Stage 2: per-kind impls (claude-code, kimi-code,
-/// opencode, codex) replace the batch `Vec<AgentEvent>` return with a
-/// streaming `Receiver<AgentEvent>` (per ADR-0003).
+/// Stage 2 streaming shape: `send` returns an `AgentEventStream`
+/// (`mpsc::Receiver<AgentEvent>`) so real agents can stream events as they
+/// arrive from the subprocess stdout. The agent impl spawns a task that pushes
+/// events into the channel and closes it after emitting `TurnEnd`.
+///
+/// `chat_id` is threaded explicitly (per ADR-0003, avoiding review F4's
+/// "trait missing per-chat identity" smell). `attachments` is shape-ready
+/// for multimodal agents; echo ignores it.
 #[async_trait]
 pub trait Agent: Send + Sync {
-    /// Process one Operator message within a Turn. Returns the Agent's
-    /// structured reply as a batch of `AgentEvent`s.
-    ///
-    /// `chat_id` is threaded explicitly (per ADR-0003, avoiding review F4's
-    /// "trait missing per-chat identity" smell). `attachments` is shape-ready
-    /// for Stage 2 multimodal agents; Stage 1 echo ignores it.
+    /// Process one Operator message within a Turn. Returns an
+    /// `AgentEventStream` — a channel receiver that yields `AgentEvent`s as
+    /// the agent produces them. The stream ends (returns `None`) after
+    /// `TurnEnd` is emitted and the agent impl closes the channel.
     async fn send(
         &self,
         chat_id: &ChatId,
         text: &str,
         attachments: &[Attachment],
-    ) -> Result<Vec<AgentEvent>, CoreError>;
+    ) -> Result<AgentEventStream, CoreError>;
 }

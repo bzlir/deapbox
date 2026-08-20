@@ -441,7 +441,12 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "deapbox-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

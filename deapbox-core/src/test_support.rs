@@ -9,12 +9,14 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use tokio::sync::mpsc;
 
 use crate::agent::Agent;
 use crate::lark_api::LarkMessageApi;
-use crate::types::{AgentEvent, Attachment, ChatId, CoreError, LarkApiError};
+use crate::types::{AgentEvent, AgentEventStream, Attachment, ChatId, CoreError, LarkApiError};
 
-/// Responder closure type for `FakeAgent`.
+/// Responder closure type for `FakeAgent`. Returns a `Vec<AgentEvent>` that
+/// the fake will stream over the channel (in order, then close).
 type Responder =
     Arc<dyn Fn(&ChatId, &str, &[Attachment]) -> Result<Vec<AgentEvent>, CoreError> + Send + Sync>;
 
@@ -23,8 +25,8 @@ type Responder =
 /// A scripted `Agent` impl for tests.
 ///
 /// `responder` is called for each `send`; the returned `Vec<AgentEvent>` is
-/// what `dispatch` will render. Default behavior: echo the input text +
-/// `TurnEnd{None}` (matches `EchoAgent`).
+/// streamed over an mpsc channel (in order, then channel closes). Default
+/// behavior: echo the input text + `TurnEnd{None}` (matches `EchoAgent`).
 pub struct FakeAgent {
     pub responder: Responder,
 }
@@ -71,8 +73,17 @@ impl Agent for FakeAgent {
         chat_id: &ChatId,
         text: &str,
         attachments: &[Attachment],
-    ) -> Result<Vec<AgentEvent>, CoreError> {
-        (self.responder)(chat_id, text, attachments)
+    ) -> Result<AgentEventStream, CoreError> {
+        let events = (self.responder)(chat_id, text, attachments)?;
+        let (tx, rx) = mpsc::channel::<AgentEvent>(8);
+        tokio::spawn(async move {
+            for event in events {
+                if tx.send(event).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(rx)
     }
 }
 

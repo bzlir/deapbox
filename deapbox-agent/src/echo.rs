@@ -5,9 +5,10 @@
 //! without spawning real agent subprocesses.
 
 use async_trait::async_trait;
+use tokio::sync::mpsc;
 
 use deapbox_core::agent::Agent;
-use deapbox_core::types::{AgentEvent, Attachment, ChatId, CoreError};
+use deapbox_core::types::{AgentEvent, AgentEventStream, Attachment, ChatId, CoreError};
 
 /// Stateless echo agent. Multiple chats can share one `Arc<EchoAgent>`.
 #[derive(Debug, Default)]
@@ -26,11 +27,14 @@ impl Agent for EchoAgent {
         _chat_id: &ChatId,
         text: &str,
         _attachments: &[Attachment],
-    ) -> Result<Vec<AgentEvent>, CoreError> {
-        Ok(vec![
-            AgentEvent::Text(text.to_owned()),
-            AgentEvent::TurnEnd { resume_key: None },
-        ])
+    ) -> Result<AgentEventStream, CoreError> {
+        let (tx, rx) = mpsc::channel::<AgentEvent>(8);
+        let text = text.to_owned();
+        tokio::spawn(async move {
+            let _ = tx.send(AgentEvent::Text(text)).await;
+            let _ = tx.send(AgentEvent::TurnEnd { resume_key: None }).await;
+        });
+        Ok(rx)
     }
 }
 
@@ -43,12 +47,21 @@ mod tests {
         ChatId("oc_test".to_owned())
     }
 
+    async fn collect_stream(mut stream: AgentEventStream) -> Vec<AgentEvent> {
+        let mut events = Vec::new();
+        while let Some(event) = stream.recv().await {
+            events.push(event);
+        }
+        events
+    }
+
     // ============ V4.1: original text echoed verbatim ============
 
     #[tokio::test]
     async fn v4_1_echo_returns_text_verbatim_and_turn_end() {
         let agent = EchoAgent::new();
-        let events = agent.send(&chat(), "hello", &[]).await.unwrap();
+        let stream = agent.send(&chat(), "hello", &[]).await.unwrap();
+        let events = collect_stream(stream).await;
         assert_eq!(
             events,
             vec![
@@ -63,7 +76,8 @@ mod tests {
     #[tokio::test]
     async fn v4_2_non_ascii_text_echoed_verbatim() {
         let agent = EchoAgent::new();
-        let events = agent.send(&chat(), "中文测试 🎉", &[]).await.unwrap();
+        let stream = agent.send(&chat(), "中文测试 🎉", &[]).await.unwrap();
+        let events = collect_stream(stream).await;
         assert_eq!(
             events,
             vec![
@@ -78,7 +92,8 @@ mod tests {
     #[tokio::test]
     async fn v4_3_empty_text_echoed_as_empty_string() {
         let agent = EchoAgent::new();
-        let events = agent.send(&chat(), "", &[]).await.unwrap();
+        let stream = agent.send(&chat(), "", &[]).await.unwrap();
+        let events = collect_stream(stream).await;
         assert_eq!(
             events,
             vec![
@@ -96,8 +111,8 @@ mod tests {
         let attachments = vec![Attachment::Image {
             image_key: "img_test_key".to_owned(),
         }];
-        let events = agent.send(&chat(), "hello", &attachments).await.unwrap();
-        // Same as V4.1 — attachments don't change echo behavior
+        let stream = agent.send(&chat(), "hello", &attachments).await.unwrap();
+        let events = collect_stream(stream).await;
         assert_eq!(
             events,
             vec![
@@ -112,14 +127,16 @@ mod tests {
     #[tokio::test]
     async fn multiple_chats_sharing_one_echo_agent_all_get_correct_echo() {
         let agent = EchoAgent::new();
-        let events_a = agent
+        let stream_a = agent
             .send(&ChatId("oc_a".to_owned()), "from A", &[])
             .await
             .unwrap();
-        let events_b = agent
+        let stream_b = agent
             .send(&ChatId("oc_b".to_owned()), "from B", &[])
             .await
             .unwrap();
+        let events_a = collect_stream(stream_a).await;
+        let events_b = collect_stream(stream_b).await;
         assert_eq!(events_a[0], AgentEvent::Text("from A".to_owned()));
         assert_eq!(events_b[0], AgentEvent::Text("from B".to_owned()));
     }

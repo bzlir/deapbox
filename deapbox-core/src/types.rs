@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use tokio::sync::mpsc;
 
 // ============ Identifiers (NewType) ============
 
@@ -63,6 +64,19 @@ pub enum Attachment {
     /// via `LarkMessageApi::download_image` (Stage 2).
     Image { image_key: String },
 }
+
+// ============ Agent output stream ============
+
+/// A stream of `AgentEvent`s returned by `Agent::send` (Stage 2 streaming shape).
+///
+/// Stage 1 returned `Vec<AgentEvent>` (batch); Stage 2 returns `mpsc::Receiver`
+/// so real agents (opencode, claude-code) can stream events as they arrive
+/// from the subprocess stdout, without buffering the entire turn first.
+///
+/// Stream end = sender drop (channel returns `None` on next `recv`). The agent
+/// impl is responsible for spawning a task that pushes events and closing the
+/// channel when the turn finishes (after emitting `TurnEnd`).
+pub type AgentEventStream = mpsc::Receiver<AgentEvent>;
 
 // ============ Agent output ============
 

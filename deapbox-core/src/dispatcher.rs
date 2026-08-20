@@ -39,23 +39,19 @@ pub struct ChatDispatcher {
 impl ChatDispatcher {
     /// Launch N per-chat worker tasks and return a dispatcher handle.
     ///
-    /// `bindings` maps `ChatId → Binding`; `agents` maps `AgentId → Agent`.
-    /// For each binding, the matching agent is looked up and Arc-cloned into
-    /// a dedicated task. Tasks run infinite loops; drop aborts them.
+    /// `chat_agents` maps `ChatId → Agent` — one agent instance per chat.
+    /// Stateless agents (echo) can share via `Arc::clone`; stateful agents
+    /// (opencode, with per-chat workspace + session_id) get dedicated
+    /// instances. The caller (cli) is responsible for constructing agents
+    /// with the right workspace from the binding.
     pub fn start(
-        bindings: HashMap<ChatId, crate::types::Binding>,
-        agents: HashMap<crate::types::AgentId, Arc<dyn Agent>>,
+        chat_agents: HashMap<ChatId, Arc<dyn Agent>>,
         lark_api: Arc<dyn LarkMessageApi>,
     ) -> Self {
         let mut routes = HashMap::new();
-        let mut task_handles = Vec::with_capacity(bindings.len());
+        let mut task_handles = Vec::with_capacity(chat_agents.len());
 
-        for (chat_id, binding) in bindings {
-            let agent = match agents.get(&binding.agent_id) {
-                Some(a) => Arc::clone(a),
-                None => continue, // dangling agent_id — skip; startup should validate
-            };
-
+        for (chat_id, agent) in chat_agents {
             let (tx, rx) = mpsc::unbounded_channel::<UserMessage>();
             routes.insert(chat_id.clone(), tx);
 
@@ -95,7 +91,7 @@ impl Drop for ChatDispatcher {
 }
 
 /// Per-chat worker task body. Runs an infinite loop:
-/// `recv → agent.send → render events → lark.send_text → loop`.
+/// `recv inbound → agent.send (returns stream) → while let recv stream → render → loop`.
 async fn per_chat_task(
     chat_id: ChatId,
     agent: Arc<dyn Agent>,
@@ -109,8 +105,8 @@ async fn per_chat_task(
             "inbound: received from operator"
         );
 
-        let events = match agent.send(&chat_id, &msg.text, &msg.attachments).await {
-            Ok(events) => events,
+        let mut stream = match agent.send(&chat_id, &msg.text, &msg.attachments).await {
+            Ok(stream) => stream,
             Err(err) => {
                 tracing::error!(
                     chat_id = %chat_id.0,
@@ -121,15 +117,17 @@ async fn per_chat_task(
             }
         };
 
-        tracing::info!(
-            chat_id = %chat_id.0,
-            events = events.len(),
-            "agent.reply: events returned"
-        );
-
-        for event in events {
+        let mut event_count = 0;
+        while let Some(event) = stream.recv().await {
+            event_count += 1;
             render_event(&chat_id, &event, lark_api.as_ref()).await;
         }
+
+        tracing::info!(
+            chat_id = %chat_id.0,
+            events = event_count,
+            "agent.reply: stream closed (turn complete)"
+        );
     }
 }
 
@@ -166,17 +164,10 @@ async fn render_event(chat_id: &ChatId, event: &AgentEvent, lark_api: &dyn LarkM
 mod tests {
     use super::*;
     use crate::test_support::{FakeAgent, FakeLarkMessageApi};
-    use crate::types::{AgentId, Binding, CoreError, UserId};
+    use crate::types::{CoreError, UserId};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::time::sleep;
-
-    fn binding(agent_id: &str) -> Binding {
-        Binding {
-            agent_id: AgentId(agent_id.to_owned()),
-            workspace: None,
-        }
-    }
 
     fn msg(chat_id: &str, text: &str) -> UserMessage {
         UserMessage {
@@ -189,19 +180,14 @@ mod tests {
     }
 
     fn dispatcher_with(
-        bindings: Vec<(&str, &str)>,
-        agents: Vec<(&str, FakeAgent)>,
+        chat_agents: Vec<(&str, FakeAgent)>,
         lark: Arc<FakeLarkMessageApi>,
     ) -> ChatDispatcher {
-        let bindings_map: HashMap<ChatId, Binding> = bindings
-            .iter()
-            .map(|(chat, agent_id)| (ChatId((*chat).to_owned()), binding(agent_id)))
-            .collect();
-        let agents_map: HashMap<AgentId, Arc<dyn Agent>> = agents
+        let map: HashMap<ChatId, Arc<dyn Agent>> = chat_agents
             .into_iter()
-            .map(|(id, fake)| (AgentId(id.to_owned()), Arc::new(fake) as Arc<dyn Agent>))
+            .map(|(chat, fake)| (ChatId(chat.to_owned()), Arc::new(fake) as Arc<dyn Agent>))
             .collect();
-        ChatDispatcher::start(bindings_map, agents_map, lark as Arc<dyn LarkMessageApi>)
+        ChatDispatcher::start(map, lark as Arc<dyn LarkMessageApi>)
     }
 
     // ============ V3.1: bound chat routes to agent ============
@@ -209,11 +195,7 @@ mod tests {
     #[tokio::test]
     async fn v3_1_bound_chat_routes_to_agent_and_renders_text() {
         let lark = Arc::new(FakeLarkMessageApi::new());
-        let dispatcher = dispatcher_with(
-            vec![("oc_a", "echo-a")],
-            vec![("echo-a", FakeAgent::echo())],
-            Arc::clone(&lark),
-        );
+        let dispatcher = dispatcher_with(vec![("oc_a", FakeAgent::echo())], Arc::clone(&lark));
 
         dispatcher.dispatch(msg("oc_a", "hello")).unwrap();
         // give the task a moment to process
@@ -227,11 +209,7 @@ mod tests {
     #[tokio::test]
     async fn v3_2_unbound_chat_returns_unbound_chat_error() {
         let lark = Arc::new(FakeLarkMessageApi::new());
-        let dispatcher = dispatcher_with(
-            vec![("oc_a", "echo-a")],
-            vec![("echo-a", FakeAgent::echo())],
-            Arc::clone(&lark),
-        );
+        let dispatcher = dispatcher_with(vec![("oc_a", FakeAgent::echo())], Arc::clone(&lark));
 
         let err = dispatcher.dispatch(msg("oc_unbound", "hello")).unwrap_err();
         assert_eq!(
@@ -264,8 +242,7 @@ mod tests {
 
         let lark = Arc::new(FakeLarkMessageApi::new());
         let dispatcher = dispatcher_with(
-            vec![("oc_slow", "slow"), ("oc_fast", "fast")],
-            vec![("slow", slow), ("fast", fast)],
+            vec![("oc_slow", slow), ("oc_fast", fast)],
             Arc::clone(&lark),
         );
 
@@ -301,11 +278,7 @@ mod tests {
         });
 
         let lark = Arc::new(FakeLarkMessageApi::new());
-        let dispatcher = dispatcher_with(
-            vec![("oc_a", "ordered")],
-            vec![("ordered", agent)],
-            Arc::clone(&lark),
-        );
+        let dispatcher = dispatcher_with(vec![("oc_a", agent)], Arc::clone(&lark));
 
         // dispatch three messages in quick succession
         dispatcher.dispatch(msg("oc_a", "first")).unwrap();
@@ -332,9 +305,8 @@ mod tests {
     async fn v5_1_text_event_renders_as_plain_text() {
         let lark = Arc::new(FakeLarkMessageApi::new());
         let dispatcher = dispatcher_with(
-            vec![("oc_a", "e")],
             vec![(
-                "e",
+                "oc_a",
                 FakeAgent::canned(vec![
                     AgentEvent::Text("plain".to_owned()),
                     AgentEvent::TurnEnd { resume_key: None },
@@ -351,9 +323,8 @@ mod tests {
     async fn v5_2_thinking_event_renders_with_prefix() {
         let lark = Arc::new(FakeLarkMessageApi::new());
         let dispatcher = dispatcher_with(
-            vec![("oc_a", "e")],
             vec![(
-                "e",
+                "oc_a",
                 FakeAgent::canned(vec![
                     AgentEvent::Thinking("reasoning".to_owned()),
                     AgentEvent::TurnEnd { resume_key: None },
@@ -370,9 +341,8 @@ mod tests {
     async fn v5_3_toolcall_event_renders_with_prefix() {
         let lark = Arc::new(FakeLarkMessageApi::new());
         let dispatcher = dispatcher_with(
-            vec![("oc_a", "e")],
             vec![(
-                "e",
+                "oc_a",
                 FakeAgent::canned(vec![
                     AgentEvent::ToolCall("read_file".to_owned()),
                     AgentEvent::TurnEnd { resume_key: None },
@@ -389,9 +359,8 @@ mod tests {
     async fn v5_4_toolresult_event_renders_with_prefix() {
         let lark = Arc::new(FakeLarkMessageApi::new());
         let dispatcher = dispatcher_with(
-            vec![("oc_a", "e")],
             vec![(
-                "e",
+                "oc_a",
                 FakeAgent::canned(vec![
                     AgentEvent::ToolResult("42".to_owned()),
                     AgentEvent::TurnEnd { resume_key: None },
@@ -408,9 +377,8 @@ mod tests {
     async fn v5_5_error_event_renders_with_prefix() {
         let lark = Arc::new(FakeLarkMessageApi::new());
         let dispatcher = dispatcher_with(
-            vec![("oc_a", "e")],
             vec![(
-                "e",
+                "oc_a",
                 FakeAgent::canned(vec![
                     AgentEvent::Error {
                         message: "boom".to_owned(),
@@ -430,9 +398,8 @@ mod tests {
     async fn v5_6_turnend_event_produces_no_outbound_message() {
         let lark = Arc::new(FakeLarkMessageApi::new());
         let dispatcher = dispatcher_with(
-            vec![("oc_a", "e")],
             vec![(
-                "e",
+                "oc_a",
                 FakeAgent::canned(vec![AgentEvent::TurnEnd {
                     resume_key: Some("key123".to_owned()),
                 }]),
@@ -467,11 +434,7 @@ mod tests {
             }
         });
 
-        let dispatcher = dispatcher_with(
-            vec![("oc_a", "resilient")],
-            vec![("resilient", agent)],
-            Arc::clone(&lark),
-        );
+        let dispatcher = dispatcher_with(vec![("oc_a", agent)], Arc::clone(&lark));
 
         dispatcher.dispatch(msg("oc_a", "first")).unwrap();
         sleep(Duration::from_millis(50)).await;
