@@ -103,6 +103,12 @@ async fn per_chat_task(
     mut rx: mpsc::UnboundedReceiver<UserMessage>,
 ) {
     while let Some(msg) = rx.recv().await {
+        tracing::info!(
+            chat_id = %chat_id.0,
+            text = %msg.text,
+            "inbound: received from operator"
+        );
+
         let events = match agent.send(&chat_id, &msg.text, &msg.attachments).await {
             Ok(events) => events,
             Err(err) => {
@@ -114,6 +120,12 @@ async fn per_chat_task(
                 continue;
             }
         };
+
+        tracing::info!(
+            chat_id = %chat_id.0,
+            events = events.len(),
+            "agent.reply: events returned"
+        );
 
         for event in events {
             render_event(&chat_id, &event, lark_api.as_ref()).await;
@@ -135,6 +147,11 @@ async fn render_event(chat_id: &ChatId, event: &AgentEvent, lark_api: &dyn LarkM
     };
 
     if let Some(text) = text {
+        tracing::info!(
+            chat_id = %chat_id.0,
+            text = %text,
+            "outbound: sending to Feishu"
+        );
         if let Err(err) = lark_api.send_text(chat_id, &text).await {
             tracing::warn!(
                 chat_id = %chat_id.0,
